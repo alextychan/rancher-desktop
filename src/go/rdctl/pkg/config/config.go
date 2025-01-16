@@ -20,38 +20,32 @@ package config
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/paths"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
-
-// The CLIConfig struct is used to store the json data read from the config file.
-type CLIConfig struct {
-	User     string
-	Password string
-	Port     int
-}
 
 // ConnectionInfo stores the parameters needed to connect to an HTTP server
 type ConnectionInfo struct {
 	User     string
 	Password string
 	Host     string
-	Port     string
+	Port     int
 }
 
 var (
 	connectionSettings ConnectionInfo
+	verbose            bool
 
-	configDir  string
 	configPath string
 	// DefaultConfigPath - used to differentiate not being able to find a user-specified config file from the default
 	DefaultConfigPath string
@@ -59,75 +53,82 @@ var (
 
 // DefineGlobalFlags sets up the global flags, available for all sub-commands
 func DefineGlobalFlags(rootCmd *cobra.Command) {
+	var configDir string
 	var err error
 	if runtime.GOOS == "linux" && isWSLDistro() {
 		if configDir, err = wslifyConfigDir(); err != nil {
 			log.Fatalf("Can't get WSL config-dir: %v", err)
 		}
+		configDir = filepath.Join(configDir, "rancher-desktop")
 	} else {
-		configDir, err = os.UserConfigDir()
+		appPaths, err := paths.GetPaths()
 		if err != nil {
-			log.Fatalf("Can't get config-dir: %v", err)
+			log.Fatalf("failed to get paths: %s", err)
 		}
+		configDir = appPaths.AppHome
 	}
-	DefaultConfigPath = filepath.Join(configDir, "rancher-desktop", "rd-engine.json")
+	DefaultConfigPath = filepath.Join(configDir, "rd-engine.json")
 	rootCmd.PersistentFlags().StringVar(&configPath, "config-path", "", fmt.Sprintf("config file (default %s)", DefaultConfigPath))
 	rootCmd.PersistentFlags().StringVar(&connectionSettings.User, "user", "", "overrides the user setting in the config file")
-	rootCmd.PersistentFlags().StringVar(&connectionSettings.Host, "host", "", "default is localhost; most useful for WSL")
-	rootCmd.PersistentFlags().StringVar(&connectionSettings.Port, "port", "", "overrides the port setting in the config file")
+	rootCmd.PersistentFlags().StringVar(&connectionSettings.Host, "host", "", "default is 127.0.0.1; most useful for WSL")
+	rootCmd.PersistentFlags().IntVar(&connectionSettings.Port, "port", 0, "overrides the port setting in the config file")
 	rootCmd.PersistentFlags().StringVar(&connectionSettings.Password, "password", "", "overrides the password setting in the config file")
+	rootCmd.PersistentFlags().BoolVar(&verbose, "verbose", false, "Be verbose")
 }
 
-// GetConnectionInfo returns the connection info if it has it, and an error message explaining why
-// it isn't available if it doesn't have it.
-// So if the user runs an `rdctl` command after a factory reset, there is no config file (in the default location),
-// but it might not be necessary. So only use the error message for the missing file if it is actually needed.
-func GetConnectionInfo() (*ConnectionInfo, error) {
-	isImmediateError, err := finishConnectionSettings()
-	if err != nil && (isImmediateError || insufficientConnectionInfo()) {
-		return nil, err
-	}
-	return &connectionSettings, nil
-}
+// GetConnectionInfo returns the connection details of the application API server.
+// As a special case this function may return a nil *ConnectionInfo and nil error
+// when the config file has not been specified explicitly, the default config file
+// does not exist, and the mayBeMissing parameter is true.
+func GetConnectionInfo(mayBeMissing bool) (*ConnectionInfo, error) {
+	var settings ConnectionInfo
 
-func finishConnectionSettings() (bool, error) {
 	if configPath == "" {
 		configPath = DefaultConfigPath
 	}
-	if connectionSettings.Host == "" {
-		connectionSettings.Host = "localhost"
-	}
-	content, err := ioutil.ReadFile(configPath)
-	if err != nil {
-		// If the default config file isn't available, it might not have been created yet,
-		// so don't complain if we don't need it.
-		// But if the user specified their own --config-path and it's not readable, complain immediately.
-		return configPath != DefaultConfigPath, err
-	}
-
-	var settings CLIConfig
-	if err = json.Unmarshal(content, &settings); err != nil {
-		return configPath != DefaultConfigPath, fmt.Errorf("error in config file %s: %w", configPath, err)
+	content, readFileError := os.ReadFile(configPath)
+	if readFileError != nil {
+		// It is ok if the default config path doesn't exist; the user may have specified the required settings on the commandline.
+		// But it is an error if the file specified via --config-path can not be read.
+		if configPath != DefaultConfigPath || !errors.Is(readFileError, os.ErrNotExist) {
+			return nil, readFileError
+		}
+	} else if err := json.Unmarshal(content, &settings); err != nil {
+		return nil, fmt.Errorf("error parsing config file %q: %w", configPath, err)
 	}
 
-	if connectionSettings.User == "" {
-		connectionSettings.User = settings.User
+	// CLI options override file settings
+	if connectionSettings.Host != "" {
+		settings.Host = connectionSettings.Host
 	}
-	if connectionSettings.Password == "" {
-		connectionSettings.Password = settings.Password
+	if settings.Host == "" {
+		settings.Host = "127.0.0.1"
 	}
-	if connectionSettings.Port == "" {
-		connectionSettings.Port = strconv.Itoa(settings.Port)
+	if connectionSettings.User != "" {
+		settings.User = connectionSettings.User
 	}
-	return false, nil
-}
+	if connectionSettings.Password != "" {
+		settings.Password = connectionSettings.Password
+	}
+	if connectionSettings.Port != 0 {
+		settings.Port = connectionSettings.Port
+	}
+	if settings.Port == 0 || settings.User == "" || settings.Password == "" {
+		// Missing the default config file may or may not be considered an error
+		if readFileError != nil {
+			if mayBeMissing {
+				readFileError = nil
+			}
+			return nil, readFileError
+		}
+		return nil, errors.New("insufficient connection settings (missing one or more of: port, user, and password)")
+	}
 
-func insufficientConnectionInfo() bool {
-	return connectionSettings.Port == "" || connectionSettings.User == "" || connectionSettings.Password == ""
+	return &settings, nil
 }
 
 // determines if we are running in a wsl linux distro
-// by checking for availibily of wslpath and see if it's a symlink
+// by checking for availability of wslpath and see if it's a symlink
 func isWSLDistro() bool {
 	fi, err := os.Lstat("/bin/wslpath")
 	if os.IsNotExist(err) {
@@ -136,10 +137,10 @@ func isWSLDistro() bool {
 	return fi.Mode()&os.ModeSymlink == os.ModeSymlink
 }
 
-func getAppDataPath() (string, error) {
+func getLocalAppDataPath() (string, error) {
 	var outBuf bytes.Buffer
 	// changes the codepage to 65001 which is UTF-8
-	subCommand := `chcp 65001 >nul & echo %APPDATA%`
+	subCommand := `chcp 65001 >nul & echo %LOCALAPPDATA%`
 	cmd := exec.Command("cmd.exe", "/c", subCommand)
 	cmd.Stdout = &outBuf
 	// We are intentionally not using CombinedOutput and
@@ -152,7 +153,7 @@ func getAppDataPath() (string, error) {
 }
 
 func wslifyConfigDir() (string, error) {
-	path, err := getAppDataPath()
+	path, err := getLocalAppDataPath()
 	if err != nil {
 		return "", err
 	}
@@ -163,4 +164,12 @@ func wslifyConfigDir() (string, error) {
 		return "", err
 	}
 	return strings.TrimRight(outBuf.String(), "\r\n"), err
+}
+
+// PersistentPreRunE is meant to be executed as the cobra hook
+func PersistentPreRunE(cmd *cobra.Command, args []string) error {
+	if verbose {
+		logrus.SetLevel(logrus.TraceLevel)
+	}
+	return nil
 }

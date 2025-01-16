@@ -4,6 +4,7 @@
       v-if="showOutput"
       :current-command="currentCommand"
       :image-output-culler="imageOutputCuller"
+      :image-to-pull="image"
       @ok:process-end="onProcessEnd"
     >
       <template #loading="{ isLoading }">
@@ -21,7 +22,7 @@
           color="error"
         >
           {{ hasError }}
-          <span class="icon icon-info icon-lg " />
+          <span class="icon icon-info-circle icon-lg " />
           {{ errorText }}
         </banner>
       </template>

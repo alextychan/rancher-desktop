@@ -4,8 +4,20 @@ import UpdateStatus from '../UpdateStatus.vue';
 
 import { UpdateState } from '@pkg/main/update';
 
+jest.mock('@pkg/utils/ipcRenderer', () => {
+  return {
+    ipcRenderer: {
+      on:   jest.fn(),
+      send: jest.fn(),
+    },
+  };
+});
+
 function wrap(props: UpdateStatus['$props']) {
-  return mount(UpdateStatus, { propsData: props });
+  return mount(UpdateStatus, {
+    propsData: props,
+    mocks:     { t: jest.fn() },
+  });
 }
 
 describe('UpdateStatus.vue', () => {
@@ -98,7 +110,13 @@ describe('UpdateStatus.vue', () => {
           available:  true,
           downloaded: false,
           info:       {
-            version: 'v1.2.3', files: [], path: '', sha512: '', releaseDate: '',
+            version:                    'v1.2.3',
+            files:                      [],
+            path:                       '',
+            sha512:                     '',
+            releaseDate:                '',
+            nextUpdateTime:             12345,
+            unsupportedUpdateAvailable: false,
           },
           progress: {
             percent:        12.34,

@@ -51,6 +51,8 @@
   --header-border              : #{$medium};
   --header-btn-bg              : #{$dark};
   --header-btn-text            : #{$lightest};
+  --footer-bg                  : #{$darker};
+  --footer-border              : #{$medium};
 
   --nav-bg                     : #{$darkest};
   --nav-active                 : var(--primary-active-bg);
@@ -83,7 +85,11 @@
   --checkbox-border            : #{$medium};
   --checkbox-tick-disabled     : #{lighten($disabled, 50%)};
   --checkbox-disabled-bg       : #{$disabled};
+  --checkbox-tick-locked       : #{$darkest};
+  --checkbox-locked-bg         : #{lighten($disabled, 50%)};
   --checkbox-ticked-bg         : var(--primary);
+  --checkbox-locked-border     : #{lighten($disabled, 50%)};
+  --checkbox-locked-shadow     : #{lighten($disabled, 50%)};
 
   --dropdown-bg                : #{mix($medium, $dark, 10%)};
   --dropdown-border            : #{$light};
@@ -95,6 +101,7 @@
   --dropdown-hover-bg          : #{$link};
   --dropdown-disabled-bg       : #{$disabled};
   --dropdown-disabled-text     : #{$disabled};
+  --dropdown-locked-text       : #{$lightest};
 
   --input-text                 : #{$lightest};
   --input-label                : #{$lighter};
@@ -110,6 +117,10 @@
   --input-disabled-border      : #{darken($medium, 30%)};
   --input-disabled-placeholder : #{darken($disabled, 10%)};
   --input-addon-bg             : #{$darker};
+  --input-locked-text          : #{$lightest};
+
+  --radio-locked-bg            : var(--body-bg);
+  --radio-locked-shadow        : var(--body-bg);
 
   --progress-bg                : #{$medium};
   --progress-divider           : #{$lightest};
@@ -136,6 +147,7 @@
   --tooltip-text               : var(--body-text);
   --tooltip-text-warning       : var(--body-text);
 
+  --icon-circle                : #{$medium};
 
   --tabbed-border              : #{$medium};
   --tabbed-sidebar-bg          : #{$darkest};

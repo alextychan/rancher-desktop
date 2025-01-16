@@ -4,13 +4,14 @@ import type { Config, PlaywrightTestOptions } from '@playwright/test';
 
 const outputDir = path.join(__dirname, '..', 'e2e', 'test-results');
 const testDir = path.join(__dirname, '..', '..', 'e2e');
-const timeScale = process.env.CI ? 2 : 1;
+// The provisioned github runners are much slower overall than cirrus's, so allow 2 hours for a full e2e run
+const timeScale = process.env.CI ? 4 : 1;
 
 const config: Config<PlaywrightTestOptions> = {
   testDir,
   outputDir,
-  timeout:       300_000 * timeScale,
-  globalTimeout: 900_000 * timeScale,
+  timeout:       10 * 60 * 1000 * timeScale,
+  globalTimeout: 30 * 60 * 1000 * timeScale,
   workers:       1,
   reporter:      'list',
 };

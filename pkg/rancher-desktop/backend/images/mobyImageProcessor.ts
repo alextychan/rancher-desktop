@@ -31,6 +31,10 @@ export default class MobyImageProcessor extends imageProcessor.ImageProcessor {
   protected async runImagesCommand(args: string[], sendNotifications = true): Promise<imageProcessor.childResultType> {
     const subcommandName = args[0];
 
+    if (this.executor.backend !== 'wsl' && !args.includes('--context')) {
+      args.unshift('--context', 'rancher-desktop');
+    }
+
     return await this.processChildOutput(spawn(executable('docker'), args), subcommandName, sendNotifications);
   }
 
@@ -84,11 +88,6 @@ export default class MobyImageProcessor extends imageProcessor.ImageProcessor {
 
   getNamespaces(): Promise<Array<string>> {
     throw new Error("docker doesn't support namespaces");
-  }
-
-  removeKimBuilder(): Promise<void> {
-    // nothing to do
-    return Promise.resolve();
   }
 
   /**

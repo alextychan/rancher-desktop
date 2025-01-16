@@ -1,8 +1,9 @@
 <script lang="ts">
-import { Checkbox } from '@rancher/components';
+
 import Vue from 'vue';
 import { mapGetters } from 'vuex';
 
+import RdCheckbox from '@pkg/components/form/RdCheckbox.vue';
 import RdFieldset from '@pkg/components/form/RdFieldset.vue';
 import { Settings } from '@pkg/config/settings';
 import { RecursiveTypes } from '@pkg/utils/typeUtils';
@@ -11,41 +12,17 @@ import type { PropType } from 'vue';
 
 export default Vue.extend({
   name:       'preferences-application-behavior',
-  components: { Checkbox, RdFieldset },
+  components: { RdCheckbox, RdFieldset },
   props:      {
     preferences: {
       type:     Object as PropType<Settings>,
       required: true,
     },
   },
-  data() {
-    return {
-      sudoAllowedTooltip: `
-        If checked, Rancher Desktop will attempt to acquire administrative
-        credentials ("sudo access") when starting for some operations.  This
-        allows for enhanced functionality, including bridged networking and
-        default docker socket support.  Changes will only be applied next time
-        Rancher Desktop starts.
-      `,
-      automaticUpdates: true,
-      statistics:       false,
-    };
-  },
-  computed: {
-    ...mapGetters('preferences', ['isPlatformWindows']),
-    isSudoAllowed(): boolean {
-      return !(this.preferences?.kubernetes?.suppressSudo ?? false);
-    },
-    canAutoUpdate(): boolean {
-      return this.preferences?.updater || false;
-    },
-  },
-  methods: {
+  computed: { ...mapGetters('preferences', ['isPreferenceLocked']) },
+  methods:  {
     onChange<P extends keyof RecursiveTypes<Settings>>(property: P, value: RecursiveTypes<Settings>[P]) {
       this.$store.dispatch('preferences/updatePreferencesData', { property, value });
-    },
-    onSudoAllowedChange(val: boolean) {
-      this.$store.dispatch('applicationSettings/commitSudoAllowed', val);
     },
   },
 });
@@ -54,36 +31,44 @@ export default Vue.extend({
 <template>
   <div class="application-behavior">
     <rd-fieldset
-      v-if="!isPlatformWindows"
-      data-test="administrativeAccess"
-      legend-text="Administrative Access"
-      :legend-tooltip="sudoAllowedTooltip"
+      data-test="autoStart"
+      :legend-text="t('application.behavior.autoStart.legendText')"
     >
-      <checkbox
-        label="Allow Rancher Desktop to acquire administrative credentials (sudo access)"
-        :value="isSudoAllowed"
-        @input="onChange('kubernetes.suppressSudo', !$event)"
+      <rd-checkbox
+        :label="t('application.behavior.autoStart.label')"
+        :value="preferences.application.autoStart"
+        :is-locked="isPreferenceLocked('application.autoStart')"
+        @input="onChange('application.autoStart', $event)"
       />
     </rd-fieldset>
     <rd-fieldset
-      data-test="automaticUpdates"
-      legend-text="Automatic Updates"
+      data-test="background"
+      :legend-text="t('application.behavior.background.legendText')"
+      :legend-tooltip="t('application.behavior.background.legendTooltip')"
+      class="checkbox-group"
     >
-      <checkbox
-        data-test="automaticUpdatesCheckbox"
-        label="Check for updates automatically"
-        :value="canAutoUpdate"
-        @input="onChange('updater', $event)"
+      <rd-checkbox
+        :label="t('application.behavior.startInBackground.label')"
+        :value="preferences.application.startInBackground"
+        :is-locked="isPreferenceLocked('application.startInBackground')"
+        @input="onChange('application.startInBackground', $event)"
+      />
+      <rd-checkbox
+        :label="t('application.behavior.windowQuitOnClose.label')"
+        :value="preferences.application.window.quitOnClose"
+        :is-locked="isPreferenceLocked('application.window.quitOnClose')"
+        @input="onChange('application.window.quitOnClose', $event)"
       />
     </rd-fieldset>
     <rd-fieldset
-      data-test="statistics"
-      legend-text="Statistics"
+      data-test="notificationIcon"
+      :legend-text="t('application.behavior.notificationIcon.legendText')"
     >
-      <checkbox
-        label="Allow collection of anonymous statistics to help us improve Rancher Desktop"
-        :value="preferences.telemetry"
-        @input="onChange('telemetry', $event)"
+      <rd-checkbox
+        :label="t('application.behavior.notificationIcon.label')"
+        :value="preferences.application.hideNotificationIcon"
+        :is-locked="isPreferenceLocked('application.hideNotificationIcon')"
+        @input="onChange('application.hideNotificationIcon', $event)"
       />
     </rd-fieldset>
   </div>
@@ -94,5 +79,11 @@ export default Vue.extend({
     display: flex;
     flex-direction: column;
     gap: 1rem;
+
+    .checkbox-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
   }
 </style>
