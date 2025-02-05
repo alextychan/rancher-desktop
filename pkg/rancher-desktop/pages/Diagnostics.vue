@@ -26,5 +26,8 @@ export default Vue.extend({
 </script>
 
 <template>
-  <diagnostics-body :rows="diagnostics" :time-last-run="timeLastRun"></diagnostics-body>
+  <diagnostics-body
+    :rows="diagnostics"
+    :time-last-run="timeLastRun"
+  ></diagnostics-body>
 </template>

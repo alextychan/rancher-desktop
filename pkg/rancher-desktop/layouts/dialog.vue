@@ -12,7 +12,11 @@
   -->
 
 <template>
-  <div ref="wrapper" class="wrapper" open>
+  <div
+    ref="wrapper"
+    class="wrapper"
+    open
+  >
     <Nuxt class="body" />
   </div>
 </template>
@@ -21,6 +25,7 @@
 import Vue from 'vue';
 
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
+
 export default Vue.extend({
   head() {
     // If dark-mode is set to auto (follow system-prefs) this is all we need
@@ -63,8 +68,6 @@ export default Vue.extend({
   min-width: 24rem;
   padding: 1.25rem;
   margin: 0 auto;
-  display: flex;
-  flex-flow: column;
 }
 
 .body {

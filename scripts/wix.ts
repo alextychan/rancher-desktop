@@ -5,7 +5,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import buildInstaller from './lib/installer-win32';
+import buildInstaller, { buildCustomAction } from './lib/installer-win32';
 
 async function run() {
   const distDir = path.join(process.cwd(), 'dist');
@@ -17,10 +17,14 @@ async function run() {
     if ((ex as NodeJS.ErrnoException).code !== 'ENOENT') {
       throw ex;
     }
-    console.error(`Could not find ${ appDir }, please run \`npm run build\` first.`);
+    console.error(`Could not find ${ appDir }, please run \`yarn build\` first.`);
     process.exit(1);
   }
 
+  const customActionFile = await buildCustomAction();
+
+  await fs.promises.copyFile(customActionFile,
+    path.join(appDir, path.basename(customActionFile)));
   await buildInstaller(distDir, appDir);
 }
 

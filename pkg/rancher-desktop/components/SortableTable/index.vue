@@ -384,9 +384,9 @@ export default {
     },
 
     hasDelayedColumns() {
-      const delaeydColumns = this.columns.find(c => c.delayLoading);
+      const delayedColumns = this.columns.find(c => c.delayLoading);
 
-      return !!delaeydColumns;
+      return !!delayedColumns;
     },
 
     // Generate row and column data for easier rendering in the template
@@ -693,7 +693,7 @@ export default {
     handleActionButtonClick(i, event) {
       // Each row in the table gets its own ref with
       // a number based on its index. If you are using
-      // an ActionMenu that doen't have a dependency on Vuex,
+      // an ActionMenu that doesn't have a dependency on Vuex,
       // these refs are useful because you can reuse the
       // same ActionMenu component on a page with many different
       // target elements in a list,
@@ -711,10 +711,20 @@ export default {
 
 <template>
   <div ref="container">
-    <div :class="{'titled': $slots.title && $slots.title.length}" class="sortable-table-header">
+    <div
+      :class="{'titled': $slots.title && $slots.title.length}"
+      class="sortable-table-header"
+    >
       <slot name="title" />
-      <div v-if="showHeaderRow" class="fixed-header-actions" :class="{button: !!$slots['header-button']}">
-        <div :class="bulkActionsClass" class="bulk">
+      <div
+        v-if="showHeaderRow"
+        class="fixed-header-actions"
+        :class="{button: !!$slots['header-button']}"
+      >
+        <div
+          :class="bulkActionsClass"
+          class="bulk"
+        >
           <slot name="header-left">
             <template v-if="tableActions">
               <button
@@ -730,7 +740,10 @@ export default {
                 @mouseover="setBulkActionOfInterest(act)"
                 @mouseleave="setBulkActionOfInterest(null)"
               >
-                <i v-if="act.icon" :class="act.icon" />
+                <i
+                  v-if="act.icon"
+                  :class="act.icon"
+                />
                 <span v-html="act.label" />
               </button>
               <ActionDropdown
@@ -765,23 +778,36 @@ export default {
                       @mouseover="setBulkActionOfInterest(act)"
                       @mouseleave="setBulkActionOfInterest(null)"
                     >
-                      <i v-if="act.icon" :class="act.icon" />
+                      <i
+                        v-if="act.icon"
+                        :class="act.icon"
+                      />
                       <span v-html="act.label" />
                     </li>
                   </ul>
                 </template>
               </ActionDropdown>
-              <label v-if="selectedRowsText" :class="bulkActionAvailabilityClass" class="action-availability">
+              <label
+                v-if="selectedRowsText"
+                :class="bulkActionAvailabilityClass"
+                class="action-availability"
+              >
                 {{ selectedRowsText }}
               </label>
             </template>
           </slot>
         </div>
-        <div v-if="$slots['header-middle'] && $slots['header-middle'].length" class="middle">
+        <div
+          v-if="$slots['header-middle'] && $slots['header-middle'].length"
+          class="middle"
+        >
           <slot name="header-middle" />
         </div>
 
-        <div v-if="search || ($slots['header-right'] && $slots['header-right'].length)" class="search row">
+        <div
+          v-if="search || ($slots['header-right'] && $slots['header-right'].length)"
+          class="search row"
+        >
           <slot name="header-right" />
           <input
             v-if="search"
@@ -795,7 +821,11 @@ export default {
         </div>
       </div>
     </div>
-    <table class="sortable-table" :class="classObject" width="100%">
+    <table
+      class="sortable-table"
+      :class="classObject"
+      width="100%"
+    >
       <THead
         v-if="showHeaders"
         :label-for="labelFor"
@@ -824,7 +854,10 @@ export default {
             <td :colspan="fullColspan">
               <div class="data-loading">
                 <i class="icon-spin icon icon-spinner" />
-                <t k="generic.loading" :raw="true" />
+                <t
+                  k="generic.loading"
+                  :raw="true"
+                />
               </div>
             </td>
           </tr>
@@ -834,7 +867,10 @@ export default {
         <slot name="no-rows">
           <tr class="no-rows">
             <td :colspan="fullColspan">
-              <t v-if="showNoRows" :k="noRowsKey" />
+              <t
+                v-if="showNoRows"
+                :k="noRowsKey"
+              />
             </td>
           </tr>
         </slot>
@@ -842,18 +878,37 @@ export default {
       <tbody v-else-if="noResults">
         <slot name="no-results">
           <tr class="no-results">
-            <td :colspan="fullColspan" class="text-center">
+            <td
+              :colspan="fullColspan"
+              class="text-center"
+            >
               <t :k="noDataKey" />
             </td>
           </tr>
         </slot>
       </tbody>
-      <tbody v-for="group in displayRows" v-else :key="group.key" :class="{ group: groupBy }">
-        <slot v-if="groupBy" name="group-row" :group="group" :full-colspan="fullColspan">
+      <tbody
+        v-for="group in displayRows"
+        v-else
+        :key="group.key"
+        :class="{ group: groupBy }"
+      >
+        <slot
+          v-if="groupBy"
+          name="group-row"
+          :group="group"
+          :full-colspan="fullColspan"
+        >
           <tr class="group-row">
             <td :colspan="fullColspan">
-              <slot name="group-by" :group="group.grp">
-                <div v-trim-whitespace class="group-tab">
+              <slot
+                name="group-by"
+                :group="group.grp"
+              >
+                <div
+                  v-trim-whitespace
+                  class="group-tab"
+                >
                   {{ group.ref }}
                 </div>
               </slot>
@@ -861,16 +916,40 @@ export default {
           </tr>
         </slot>
         <template v-for="(row, i) in group.rows">
-          <slot name="main-row" :row="row.row">
-            <slot :name="'main-row:' + (row.row.mainRowKey || i)" :full-colspan="fullColspan">
+          <slot
+            name="main-row"
+            :row="row.row"
+          >
+            <slot
+              :name="'main-row:' + (row.row.mainRowKey || i)"
+              :full-colspan="fullColspan"
+            >
               <!-- The data-cant-run-bulk-action-of-interest attribute is being used instead of :class because
               because our selection.js invokes toggleClass and :class clobbers what was added by toggleClass if
               the value of :class changes. -->
-              <tr :key="row.key" class="main-row" :class="{ 'has-sub-row': row.showSubRow}" :data-node-id="row.key" :data-cant-run-bulk-action-of-interest="actionOfInterest && !row.canRunBulkActionOfInterest">
-                <td v-if="tableActions" class="row-check" align="middle">
-                  {{ row.mainRowKey }}<Checkbox class="selection-checkbox" :data-node-id="row.key" :value="selectedRows.includes(row.row)" />
+              <tr
+                :key="row.key"
+                class="main-row"
+                :class="{ 'has-sub-row': row.showSubRow}"
+                :data-node-id="row.key"
+                :data-cant-run-bulk-action-of-interest="actionOfInterest && !row.canRunBulkActionOfInterest"
+              >
+                <td
+                  v-if="tableActions"
+                  class="row-check"
+                  align="middle"
+                >
+                  {{ row.mainRowKey }}<Checkbox
+                    class="selection-checkbox"
+                    :data-node-id="row.key"
+                    :value="selectedRows.includes(row.row)"
+                  />
                 </td>
-                <td v-if="subExpandColumn" class="row-expand" align="middle">
+                <td
+                  v-if="subExpandColumn"
+                  class="row-expand"
+                  align="middle"
+                >
                   <i
                     data-title="Toggle Expand"
                     :class="{
@@ -897,7 +976,12 @@ export default {
                       :class="{['col-'+col.dasherize]: !!col.col.formatter, [col.col.breakpoint]: !!col.col.breakpoint, ['skip-select']: col.col.skipSelect}"
                       :width="col.col.width"
                     >
-                      <slot :name="'cell:' + col.col.name" :row="row.row" :col="col.col" :value="col.value">
+                      <slot
+                        :name="'cell:' + col.col.name"
+                        :row="row.row"
+                        :col="col.col"
+                        :value="col.value"
+                      >
                         <component
                           :is="col.component"
                           v-if="col.component && col.needRef"
@@ -937,8 +1021,14 @@ export default {
                     </td>
                   </slot>
                 </template>
-                <td v-if="rowActions" align="middle">
-                  <slot name="row-actions" :row="row">
+                <td
+                  v-if="rowActions"
+                  align="middle"
+                >
+                  <slot
+                    name="row-actions"
+                    :row="row"
+                  >
                     <button
                       :id="`actionButton+${i}+${(row.row && row.row.name) ? row.row.name : ''}`"
                       :ref="`actionButton${i}`"
@@ -969,9 +1059,16 @@ export default {
               @mouseenter="onRowMouseEnter"
               @mouseleave="onRowMouseLeave"
             >
-              <td v-if="tableActions" class="row-check" align="middle">
+              <td
+                v-if="tableActions"
+                class="row-check"
+                align="middle"
+              >
               </td>
-              <td :colspan="fullColspan - (tableActions ? 1: 0)" :class="{ 'text-error' : row.row.stateObj.error }">
+              <td
+                :colspan="fullColspan - (tableActions ? 1: 0)"
+                :class="{ 'text-error' : row.row.stateObj.error }"
+              >
                 {{ row.row.stateDescription }}
               </td>
             </tr>
@@ -979,7 +1076,10 @@ export default {
         </template>
       </tbody>
     </table>
-    <div v-if="showPaging" class="paging">
+    <div
+      v-if="showPaging"
+      class="paging"
+    >
       <button
         type="button"
         class="btn btn-sm role-multi-action"
@@ -1016,12 +1116,33 @@ export default {
         <i class="icon icon-chevron-end" />
       </button>
     </div>
-    <button v-if="search" v-shortkey.once="['/']" class="hide" @shortkey="focusSearch()" />
+    <button
+      v-if="search"
+      v-shortkey.once="['/']"
+      class="hide"
+      @shortkey="focusSearch()"
+    />
     <template v-if="tableActions">
-      <button v-shortkey="['j']" class="hide" @shortkey="focusNext($event)" />
-      <button v-shortkey="['k']" class="hide" @shortkey="focusPrevious($event)" />
-      <button v-shortkey="['shift','j']" class="hide" @shortkey="focusNext($event, true)" />
-      <button v-shortkey="['shift','k']" class="hide" @shortkey="focusPrevious($event, true)" />
+      <button
+        v-shortkey="['j']"
+        class="hide"
+        @shortkey="focusNext($event)"
+      />
+      <button
+        v-shortkey="['k']"
+        class="hide"
+        @shortkey="focusPrevious($event)"
+      />
+      <button
+        v-shortkey="['shift','j']"
+        class="hide"
+        @shortkey="focusNext($event, true)"
+      />
+      <button
+        v-shortkey="['shift','k']"
+        class="hide"
+        @shortkey="focusPrevious($event, true)"
+      />
       <slot name="shortkeys" />
     </template>
   </div>
@@ -1284,7 +1405,7 @@ $spacing: 10px;
 }
 
 .fixed-header-actions {
-  padding: 0 0 20px 0;
+  padding: 1px 0 20px 0;
   width: 100%;
   z-index: z-index('fixedTableHeader');
   background: transparent;
@@ -1300,6 +1421,10 @@ $spacing: 10px;
 
     & > BUTTON {
       display: none; // Handled dynamically
+
+      i {
+        margin: 4px;
+      }
     }
 
     & > BUTTON:not(:last-of-type) {

@@ -4,7 +4,8 @@
   -
   - This file is a Mustache template that is rendered via installer-win32.ts.
   -->
-<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+  xmlns:fire="http://schemas.microsoft.com/wix/FirewallExtension">
   <Product
     Id="*"
     Name="Rancher Desktop"
@@ -22,13 +23,11 @@
       AllowSameVersionUpgrades="yes"
       DowngradeErrorMessage='A newer version of [ProductName] is already installed.'
       Schedule="afterInstallInitialize" />
-    <MediaTemplate CompressionLevel="{{compressionLevel}}" EmbedCab="yes" />
+    <MediaTemplate CompressionLevel="high" EmbedCab="yes" />
     <UIRef Id="WixUI_RD" />
 
     <Property Id="ApplicationFolderName" Value="Rancher Desktop" />
-    <Icon
-      Id="RancherDesktopIcon.exe"
-      SourceFile="$(var.appDir)\Rancher Desktop.exe" />
+    <Icon Id="RancherDesktopIcon.exe" SourceFile="$(var.iconPath)" />
     <Property Id="ARPPRODUCTICON" Value="RancherDesktopIcon.exe" />
     <Property Id="ARPNOMODIFY" Value="1" />
     <Property Id="ARPURLINFOABOUT" Value="https://rancherdesktop.io/" />
@@ -37,47 +36,45 @@
 
     <DirectoryRef Id="TARGETDIR" />
 
-    <!-- Install WSL if the kernel is not already installed. -->
-    <Upgrade Id="{1C3DB5B6-65A5-4EBC-A5B9-2F2D6F665F48}">
-      <UpgradeVersion OnlyDetect="yes" Property="WSLKERNELINSTALLED" Minimum="5.4.0" />
-    </Upgrade>
-    <!--
-      - If doing a per-user upgrade, we can't detect WSL because Windows
-      - Installer refuses to find per-machine packages for a per-user install.
-      - We need to manually search for a previous version of RD and assume that
-      - it's set.
-      -->
-    <Upgrade Id="{1F717D5A-A55B-5FE2-9103-C0D74F7FBDE3}">
-      <UpgradeVersion OnlyDetect="yes" Property="RD_INSTALLED" Minimum="0.0.0" />
-    </Upgrade>
-    <SetProperty Id="WSLKERNELINSTALLED" Value="1" After="AppSearch">
-      (RD_INSTALLED OR NSISUNINSTALLCOMMAND) AND NOT WSLKERNELINSTALLED
-    </SetProperty>
     <SetProperty Id="ALLUSERS" Sequence="both" After="ValidateProductID" Value="1">
-      NOT WSLKERNELINSTALLED AND NOT Installed
+      NOT WSLINSTALLED AND NOT Installed
     </SetProperty>
     <SetProperty Id="MSIINSTALLPERUSER" Sequence="first" After="ValidateProductID" Value="0">
-      (NOT WSLKERNELINSTALLED OR NOT MSIINSTALLPERUSER) AND NOT Installed
+      (NOT WSLINSTALLED OR NOT MSIINSTALLPERUSER) AND NOT Installed
     </SetProperty>
-    <SetProperty Id="PowerShellExe" Sequence="execute" Before="SetInstallWSL"
-      Value="&quot;[System64Folder]\WindowsPowerShell\v1.0\powershell.exe&quot;" />
-    <Property Id="PowerShellArgs"
-      Value="-NoProfile -NonInteractive -ExecutionPolicy RemoteSigned" />
-    <SetProperty Id="InstallWSL" Sequence="execute" Before="InstallWSL"
-      Value="[PowerShellExe] [PowerShellArgs] -File &quot;[#f_install_wsl]&quot;">
-      NOT WSLKERNELINSTALLED
-    </SetProperty>
-    <CustomAction
-      Id="InstallWSL" BinaryKey="WixCA" DllEntry="WixQuietExec64"
-      Execute="deferred" Return="check" Impersonate="no"
-    />
-    <InstallExecuteSequence>
-      <Custom Action="InstallWSL" After="InstallFiles">
-        NOT WSLKERNELINSTALLED AND NOT Installed
+
+    <!-- Custom action to detect if WSL is installed -->
+    <Binary Id="CustomActionBinary" SourceFile="wix-custom-action.dll" />
+    <CustomAction Id="DetectWSL" BinaryKey="CustomActionBinary" DllEntry="DetectWSL"
+      Execute="immediate" Return="check" />
+    <!-- Custom action to update WSL -->
+    <CustomAction Id="UpdateWSL" BinaryKey="CustomActionBinary" DllEntry="UpdateWSL"
+      Execute="deferred" Return="check" Impersonate="yes" />
+    <!-- Custom action to raise an error because WSL was not installed -->
+    <CustomAction Id="ErrorWSLNotInstalled" Error="100" />
+
+    <InstallUISequence>
+      <!--
+        - DetectWSL may set the WSLINSTALLED and WSLKERNELOUTDATED properties
+        - depending on the state of the system.
+        -->
+      <Custom Action="DetectWSL" After="AppSearch">
+        NOT WSLINSTALLED <!-- Skip search if user overrides -->
       </Custom>
-      <ScheduleReboot After="InstallWSL">
-        NOT WSLKERNELINSTALLED AND NOT Installed
-      </ScheduleReboot>
+      <Custom Action="ErrorWSLNotInstalled" After="RDWelcomeDlg">
+        NOT WSLINSTALLED AND NOT Installed
+      </Custom>
+    </InstallUISequence>
+    <InstallExecuteSequence>
+      <Custom Action="DetectWSL" After="AppSearch">
+        NOT WSLINSTALLED <!-- Skip search if user overrides -->
+      </Custom>
+      <Custom Action="ErrorWSLNotInstalled" After="LaunchConditions">
+        NOT WSLINSTALLED AND NOT Installed
+      </Custom>
+      <Custom Action="UpdateWSL" After="InstallFiles">
+        WSLINSTALLED AND WSLKERNELOUTDATED
+      </Custom>
     </InstallExecuteSequence>
 
     <!-- Check if the NSIS-based Rancher Desktop is installed, and uninstall if yes. -->
@@ -123,12 +120,18 @@
         Type="string"
         KeyPath="yes"
       />
-      <Environment Id="PathWindowsUser" Name="PATH"
+      <Environment Id="PathWindowsUserBin" Name="PATH"
         Action="set" Part="last" System="no" Permanent="no"
         Value="[APPLICATIONFOLDER]resources\resources\win32\bin\" />
-      <Environment Id="PathLinuxUser" Name="PATH"
+      <Environment Id="PathWindowsUserDockerCLIPlugins" Name="PATH"
+        Action="set" Part="last" System="no" Permanent="no"
+        Value="[APPLICATIONFOLDER]resources\resources\win32\docker-cli-plugins\" />
+      <Environment Id="PathLinuxUserBin" Name="PATH"
         Action="set" Part="last" System="no" Permanent="no"
         Value="[APPLICATIONFOLDER]resources\resources\linux\bin\" />
+      <Environment Id="PathLinuxUserDockerCLIPlugins" Name="PATH"
+        Action="set" Part="last" System="no" Permanent="no"
+        Value="[APPLICATIONFOLDER]resources\resources\linux\docker-cli-plugins\" />
     </Component>
     <Component Id="PathSystem" Directory="APPLICATIONFOLDER">
       <Condition>
@@ -142,12 +145,57 @@
         Type="string"
         KeyPath="yes"
       />
-      <Environment Id="PathWindowsSystem" Name="PATH"
+      <Environment Id="PathWindowsSystemBin" Name="PATH"
         Action="set" Part="last" System="yes" Permanent="no"
         Value="[APPLICATIONFOLDER]resources\resources\win32\bin\" />
-      <Environment Id="PathLinuxSystem" Name="PATH"
+      <Environment Id="PathWindowsSystemDockerCLIPlugins" Name="PATH"
+        Action="set" Part="last" System="yes" Permanent="no"
+        Value="[APPLICATIONFOLDER]resources\resources\win32\docker-cli-plugins\" />
+      <Environment Id="PathLinuxSystemBin" Name="PATH"
         Action="set" Part="last" System="yes" Permanent="no"
         Value="[APPLICATIONFOLDER]resources\resources\linux\bin\" />
+      <Environment Id="PathLinuxSystemDockerCLIPlugins" Name="PATH"
+        Action="set" Part="last" System="yes" Permanent="no"
+        Value="[APPLICATIONFOLDER]resources\resources\linux\docker-cli-plugins\" />
+    </Component>
+
+
+    <!-- Add Admin install registry element -->
+    <Component Id="AdminInstallRegistry" Directory="APPLICATIONFOLDER" Guid="752E8274-9706-4B97-8533-1E7C5080320A">
+      <Condition>
+      <![CDATA[MSIINSTALLPERUSER <> 1]]>
+      </Condition>
+      <RegistryValue
+        Root="HKLM"
+        Key='SOFTWARE\SUSE\RancherDesktop'
+        Name="AdminInstall"
+        Value="true"
+        Type="string"
+        KeyPath="yes"
+      />
+    </Component>
+
+    <!-- Add FirewallException element -->
+    <Component Id="AdminInstallFirewall" Directory="APPLICATIONFOLDER" Guid="B03D3C75-F835-47A9-8224-1D1238B4F74F" KeyPath="yes">
+      <Condition>
+      <![CDATA[MSIINSTALLPERUSER <> 1]]>
+      </Condition>
+      <fire:FirewallException
+        Id="HostSwitchFirewallPrivateException"
+        Name="Rancher Desktop Networking Private Exception"
+        Description="Rancher Desktop host-switch.exe profile exception for private networks"
+        Program="[APPLICATIONFOLDER]resources\resources\win32\internal\host-switch.exe"
+        Profile="private"
+        Scope="any"
+        Protocol="tcp" />
+      <fire:FirewallException
+        Id="HostSwitchFirewallDomainException"
+        Name="Rancher Desktop Networking Domain Exception"
+        Description="Rancher Desktop host-switch.exe profile exception for domain networks"
+        Program="[APPLICATIONFOLDER]resources\resources\win32\internal\host-switch.exe"
+        Profile="domain"
+        Scope="any"
+        Protocol="tcp" />
     </Component>
 
     <!-- If required, run the app after install (for updates) -->
@@ -170,6 +218,8 @@
       <ComponentGroupRef Id="ProductComponents" />
       <ComponentRef Id="PathUser" />
       <ComponentRef Id="PathSystem" />
+      <ComponentRef Id="AdminInstallRegistry" />
+      <ComponentRef Id="AdminInstallFirewall" />
     </Feature>
   </Product>
   {{ &fileList }}

@@ -1,8 +1,9 @@
 import _ from 'lodash';
+import semver from 'semver';
 
 import { ActionContext, MutationsType } from './ts-helpers';
 
-import { defaultTransientSettings, TransientSettings } from '@pkg/config/transientSettings';
+import { defaultTransientSettings, NavItemName, TransientSettings } from '@pkg/config/transientSettings';
 import type { ServerState } from '@pkg/main/commandServer/httpCommandServer';
 import { RecursivePartial } from '@pkg/utils/typeUtils';
 
@@ -14,20 +15,36 @@ interface CommitArgs extends ServerState {
   payload?: RecursivePartial<TransientSettings>;
 }
 
-const uri = (port: number) => `http://localhost:${ port }/v0/transient_settings`;
+interface NavigatePrefsDialogArgs extends ServerState {
+  navItem: NavItemName;
+  tab?: string;
+}
 
-export const state: () => TransientSettings = () => _.cloneDeep(defaultTransientSettings);
+type ExtendedTransientSettings = TransientSettings & {
+  macOsVersion?: semver.SemVer;
+  isArm?: boolean;
+};
 
-export const mutations: MutationsType<TransientSettings> = {
+const uri = (port: number) => `http://localhost:${ port }/v1/transient_settings`;
+
+export const state: () => ExtendedTransientSettings = () => _.cloneDeep(defaultTransientSettings);
+
+export const mutations: MutationsType<ExtendedTransientSettings> = {
   SET_PREFERENCES(state, preferences) {
     state.preferences = preferences;
   },
   SET_NO_MODAL_DIALOGS(state, noModalDialogs) {
     state.noModalDialogs = noModalDialogs;
   },
+  SET_MAC_OS_VERSION(state, macOsVersion) {
+    state.macOsVersion = macOsVersion;
+  },
+  SET_IS_ARM(state, isArm) {
+    state.isArm = isArm;
+  },
 };
 
-type TransientSettingsContext = ActionContext<TransientSettings>;
+type TransientSettingsContext = ActionContext<ExtendedTransientSettings>;
 
 export const actions = {
   setPreferences({ commit }: TransientSettingsContext, preferences: Preferences) {
@@ -68,6 +85,19 @@ export const actions = {
       'transientSettings/fetchTransientSettings',
       args,
       { root: true });
+  },
+  async navigatePrefDialog(context: TransientSettingsContext, args: NavigatePrefsDialogArgs) {
+    const commitArgs = _.omit(args, 'navItem', 'tab');
+    const { navItem, tab } = args;
+    const preferences = { navItem: { current: navItem, currentTabs: { [navItem]: tab } } };
+
+    await context.dispatch('commitPreferences', { ...commitArgs, payload: { preferences } });
+  },
+  setMacOsVersion({ commit }: TransientSettingsContext, macOsVersion: semver.SemVer) {
+    commit('SET_MAC_OS_VERSION', macOsVersion);
+  },
+  setIsArm({ commit }: TransientSettingsContext, isArm: boolean) {
+    commit('SET_IS_ARM', isArm);
   },
 };
 

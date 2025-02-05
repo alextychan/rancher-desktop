@@ -12,11 +12,12 @@ For user-oriented documentation, please see [docs.rancherdesktop.io][docs].
 
 ## Overview
 
-Rancher Desktop is an Electron application with the primary business logic
-written in TypeScript and JavaScript.  It leverages several other pieces of
-technology to provide the platform elements which include k3s, kubectl, nerdctl
-WSL, QEMU, and more. The application wraps numerous pieces of technology to
-provide one cohesive application.
+Rancher Desktop is an Electron application that is mainly written in TypeScript.
+It bundles a variety of other technologies in order to provide one cohesive application.
+It includes a command line tool, `rdctl`, which is written in Go.
+Most developer activities, such as running a development build, building/packaging
+Rancher Desktop, running unit tests, and running end-to-end tests, are done through
+`yarn` scripts. Some exceptions exist, such as running BATS tests.
 
 
 ## Setup
@@ -44,7 +45,7 @@ with an existing Windows installation.
 
 4. Close the privileged PowerShell prompt.
 5. Ensure `msbuild_path` and `msvs_version` are configured correctly in `.npmrc` file. Run the following commands to set these properties:
-   
+
    ```
    npm config set msvs_version <visual-studio-version-number>
    npm config set msbuild_path <path/to/MSBuild.exe>
@@ -57,7 +58,23 @@ with an existing Windows installation.
    npm config set msbuild_path "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe"
    ```
 
-You can now clone the repository and run `npm install`.
+   If you get an error message when trying to run `npm config set...`, run `npm config edit` and then add lines like
+
+   ```
+   msvs_version=2022
+   msbuild_path=C:\Program Files (x86)\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe
+   ```
+
+   Do not quote the values to the right side of the equal sign. The quotes aren't needed, and it's possible that some
+   processors will treat them as literal parts of the path, and then fail.
+7. Configure `git` to work with linux- and macos-originated files:
+   ```
+   git config --global --replace-all core.autocrlf false
+   git config --global --replace-all core.eol lf
+   ```
+If you find the `lint:go` tests are failing mysteriously, it's possible that the line-endings are incorrect.
+
+You can now clone the repository and run `yarn`.
 
 [development virtual machine]: https://developer.microsoft.com/en-us/windows/downloads/virtual-machines/
 [automated setup script]: ./scripts/windows-setup.ps1
@@ -68,11 +85,19 @@ You can now clone the repository and run `npm install`.
 1. Install [Windows Subsystem for Linux (WSL)] on your machine. Skip this step, if WSL is already installed.
 2. Open a PowerShell prompt (hit Windows Key + `X` and open `Windows PowerShell`).
 3. Install [Scoop] via `iwr -useb get.scoop.sh | iex`.
-4. Install git, go, nvm, and unzip via `scoop install git go nvm python unzip`.
-   Check node version with `nvm list`. If node v16 is not installed or set as the current version, then install using `nvm install 16` and set as current using `nvm use 16.xx.xx`.
-5. Install Visual Studio 2017 or higher. Make sure you have the `Windows SDK` component installed. This [Visual Studio docs] describes steps to install components.
+4. Install 7zip, git, go, mingw, nvm, and unzip via `scoop install 7zip git go mingw nvm python unzip`.
+   Check node version with `nvm list`. If node v20 is not installed or set as the current version, then install using `nvm install 20` and set as current using `nvm use 20.xx.xx`.
+5. Install the yarn package manager via `npm install --global yarn`
+6. Install Visual Studio 2017 or higher. As of this writing the latest version is available at [https://visualstudio.microsoft.com/downloads/]; if that's changed, a good search engine should find it.
+7. Make sure you have the `Windows SDK` component installed. This [Visual Studio docs] describes steps to install components.
    The [Desktop development with C++] workload needs to be selected, too.
-6. Ensure `msbuild_path` and `msvs_version` are configured correctly in `.npmrc` file. Run the following commands to set these properties:
+8. Configure `git` to work with linux- and macos-originated files:
+   ```
+   git config --global --replace-all core.autocrlf false
+   git config --global --replace-all core.eol lf
+   ```
+If you find the `lint:go` tests are failing mysteriously, it's possible that the line-endings are incorrect.
+9. Ensure `msbuild_path` and `msvs_version` are configured correctly in `.npmrc` file. Run the following commands to set these properties:
 
    ```
    npm config set msvs_version <visual-studio-version-number>
@@ -86,7 +111,17 @@ You can now clone the repository and run `npm install`.
    npm config set msbuild_path "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe"
    ```
 
-You can now clone the repository and run `npm install`.
+   If you get an error message when trying to run `npm config set...`, run `npm config edit` and then add lines like
+
+   ```
+   msvs_version=2022
+   msbuild_path=C:\Program Files (x86)\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe
+   ```
+
+   Do not quote the values to the right side of the equal sign. They aren't needed, and it's possible that some
+   processor will treat them as literal parts of the path, and then fail.
+
+You can now clone the repository and run `yarn`.
 
 [Scoop]: https://scoop.sh/
 [Visual Studio docs]: https://docs.microsoft.com/en-us/visualstudio/install/modify-visual-studio?view=vs-2022
@@ -104,28 +139,47 @@ Note that this script adds code dealing with `nvm` to a profile file
 (like `~/.bash_profile`). To add access to `nvm` to a current shell session,
 you'll need to `source` that file.
 
-Currently we build Rancher Desktop with Node 16. To install it, run:
+Currently we build Rancher Desktop with Node 20. To install it, run:
 
 ```
-nvm install 16
+nvm install 20.16
+```
+
+Next, you'll need to install the yarn package manager:
+
+```
+npm install --global yarn
 ```
 
 You'll also need to run `brew install go` if you haven't installed go.
 
 Then you can install dependencies with:
 ```
-npm install
+yarn
 ```
+
+> ### ⚠️ Working on a mac with an M1 chip?
+>
+> You will need to set the `M1` environment variable before installing dependencies and running any npm scripts:
+>
+> ```
+> export M1=1
+> yarn
+> ```
+>
+> You will want to run `git clean -fdx` to clean out any cached assets and re-downloaded with the correct arch before running `yarn` if you previously installed dependencies without setting `M1` first.
 
 ### Linux
 
 Ensure you have the following installed:
 
-- [Node.js][Node.js] v16. **Make sure you have any development packages
-  installed.** For example, on openSUSE Leap 15.3 you would need to install
-  `nodejs16` and `nodejs16-devel`.
+- [Node.js][Node.js] v20. **Make sure you have any development packages
+  installed.** For example, on openSUSE Leap 15.6 you would need to install
+  `nodejs20` and `nodejs20-devel`.
 
-- Go 1.18 or later.
+- [yarn classic][yarn-classic]
+
+- Go 1.22 or later.
 
 - Dependencies described in the [`node-gyp` docs][node-gyp] installation.
   This is required to install the [`ffi-napi`][ffi-napi] npm package. These docs mention
@@ -134,7 +188,7 @@ Ensure you have the following installed:
 Then you can install dependencies with:
 
 ```
-npm install
+yarn
 ```
 
 You can then run Rancher Desktop as described below. It may fail on the first run -
@@ -144,6 +198,7 @@ to solve this issue.
 [Node.js]: https://nodejs.org/
 [ffi-napi]: https://www.npmjs.com/package/ffi-napi
 [node-gyp]: https://github.com/nodejs/node-gyp#on-unix
+[yarn-classic]: https://classic.yarnpkg.com/lang/en/docs/install/#debian-stable
 
 
 ## Running
@@ -152,7 +207,7 @@ Once you have your dependencies installed you can run a development version
 of Rancher Desktop with:
 
 ```
-npm run dev
+yarn dev
 ```
 
 
@@ -161,13 +216,13 @@ npm run dev
 To run the unit tests:
 
 ```
-npm test
+yarn test
 ```
 
 To run the integration tests:
 
 ```
-npm run test:e2e
+yarn test:e2e
 ```
 
 
@@ -177,10 +232,76 @@ Rancher can be built from source on Windows, macOS or Linux.
 Cross-compilation is currently not supported. To run a build do:
 
 ```
-npm run build
+yarn build
+yarn package
 ```
 
 The build output goes to `dist/`.
+
+### Debugging builds with the Chrome remote debugger
+
+The Chrome remote debugger allows you to debug Electron apps using Chrome Developer Tools. You can use it to access log messages that might output to the developer console of the renderer process. This is especially helpful for getting additional debug information in production builds of Rancher Desktop.
+
+#### Starting Rancher Desktop with Remote Debugging Enabled
+
+To enable remote debugging, start Rancher Desktop with the `--remote-debugging-port` argument.
+
+On Linux, start Rancher Desktop with the following command:
+
+``` bash
+rancher-desktop --remote-debugging-port="8315" --remote-allow-origins=http://localhost:8315
+```
+
+On macOS, start Rancher Desktop with the following command:
+
+```
+/Applications/Rancher\ Desktop.app/Contents/MacOS/Rancher\ Desktop --remote-debugging-port="8315" --remote-allow-origins=http://localhost:8315
+```
+
+On Windows, start Rancher Desktop with the following command:
+
+``` powershell
+cd 'C:\Program Files\Rancher Desktop\'
+& '.\Rancher Desktop.exe' --remote-debugging-port="8315" --remote-allow-origins=http://localhost:8315
+```
+
+After Rancher Desktop starts, open Chrome and navigate to `http://localhost:8315/`. Select the available target to start remote debugging Rancher Desktop.
+
+![image](https://github.com/rak-phillip/rancher-desktop/assets/835961/4f5fcb33-d381-4900-a836-685eab3af441)
+
+![image](https://github.com/rak-phillip/rancher-desktop/assets/835961/91b4ee63-7093-4377-b8b3-f2f4a57a16a7)
+
+#### Remote Debugging an Extension
+
+To remote debug an extension, follow the same process as remote debugging a build. However, you will need to load an extension before navigating to `http://localhost:8315/`. Both Rancher Desktop and the loaded extension should be listed as available targets.
+
+![image](https://github.com/rak-phillip/rancher-desktop/assets/835961/71bb7eec-38e5-4744-a547-ebb36048918a)
+
+![image](https://github.com/rak-phillip/rancher-desktop/assets/835961/f4aad3e1-dabc-473e-9404-05609216cd03)
+
+### Debugging dev env with GoLand
+
+The following steps have been tested with GoLand on Linux but might work for other
+JetBrains IDEs in a similar way.
+
+1. Install the Node.js plugin (via `File > Settings > Plugins`)
+
+   ![image](https://github.com/s0nea/rancher-desktop/assets/8761082/f9574abb-06d9-4132-a14b-c3d445e87f7d)
+
+2. Go to the "Run/Debug Configurations" dialog (via `Run > Edit Configurations...`)
+3. Add a new Node.js configuration with the following settings:
+   - Name: a name for the debug configuration, e.g. `rancher desktop`
+   - Node interpreter: choose your installed node interpreter, e.g. `/usr/bin/node`
+   - Node parameters: `scripts/ts-wrapper.js scripts/dev.ts`
+   - Working directory: choose the working directory of your project, e.g.
+     `~/src/rancher-desktop`
+
+   ![image](https://github.com/s0nea/rancher-desktop/assets/8761082/41686095-04ba-4d9e-bac1-b5587d146381)
+
+4. Save the configuration
+5. You can now set a breakpoint and click "Debug 'rancher desktop'" to start debugging
+
+   ![image](https://github.com/s0nea/rancher-desktop/assets/8761082/87ea45f4-0a4d-4a52-9f3b-866c45e3fe2a)
 
 
 ## Development Builds
@@ -286,6 +407,17 @@ This works even if you already have a version of Rancher Desktop installed.
 There are no repositories for AppImages, but you can access the latest development
 AppImage builds [here](https://download.opensuse.org/repositories/isv:/Rancher:/dev/AppImage/).
 
+## API
+
+Rancher Desktop supports a limited HTTP-based API. The API is defined in
+`pkg/rancher-desktop/assets/specs/command-api.yaml`, and you can see examples of how it's
+invoked in the client code at `go/src/rdctl`.
+
+### Stability
+
+The API is currently at version 1, but is still considered internal and experimental, and
+is subject to change without any advance notice. At some point we expect that necessary
+changes to the API will go through a warning and deprecation notice.
 
 ## Contributing
 

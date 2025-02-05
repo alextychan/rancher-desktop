@@ -54,7 +54,7 @@ export type UpdateState = {
   available: boolean;
   downloaded: boolean;
   error?: Error;
-  info?: UpdateInfo;
+  info?: LonghornUpdateInfo;
   progress?: ProgressInfo;
 };
 const updateState: UpdateState = {
@@ -66,11 +66,15 @@ Electron.ipcMain.on('update-state', () => {
 });
 
 Electron.ipcMain.on('update-apply', () => {
-  if (!autoUpdater) {
+  if (!autoUpdater || process.env.RD_FORCE_UPDATES_ENABLED) {
     return;
   }
   autoUpdater.quitAndInstall();
 });
+
+function isLonghornUpdateInfo(info: UpdateInfo | LonghornUpdateInfo): info is LonghornUpdateInfo {
+  return (info as LonghornUpdateInfo).nextUpdateTime !== undefined;
+}
 
 /**
  * Return a new AppUpdater; if no update configuration is available, returns
@@ -97,6 +101,11 @@ async function getUpdater(): Promise<AppUpdater | undefined> {
 
     options.updateProvider = LonghornProvider;
 
+    if (process.env.RD_UPGRADE_RESPONDER_URL) {
+      console.log(`using custom upgrade responder URL ${ process.env.RD_UPGRADE_RESPONDER_URL }`);
+      options.upgradeServer = process.env.RD_UPGRADE_RESPONDER_URL;
+    }
+
     switch (os.platform()) {
     case 'win32': {
       updater = new MsiUpdater(options);
@@ -116,6 +125,10 @@ async function getUpdater(): Promise<AppUpdater | undefined> {
     throw e;
   }
 
+  if (process.env.RD_FORCE_UPDATES_ENABLED) {
+    updater.forceDevUpdateConfig = true;
+  }
+
   updater.logger = console;
   updater.autoDownload = true;
   updater.autoInstallOnAppQuit = false;
@@ -132,6 +145,9 @@ async function getUpdater(): Promise<AppUpdater | undefined> {
     setHasQueuedUpdate(false);
   });
   updater.on('update-available', (info) => {
+    if (!isLonghornUpdateInfo(info)) {
+      throw new Error('updater: event update-available: info is not of type LonghornUpdateInfo');
+    }
     console.debug('update: update available:', info);
     updateState.available = true;
     updateState.info = info;
@@ -139,6 +155,9 @@ async function getUpdater(): Promise<AppUpdater | undefined> {
     window.send('update-state', updateState);
   });
   updater.on('update-not-available', (info) => {
+    if (!isLonghornUpdateInfo(info)) {
+      throw new Error('updater: event update-not-available: info is not of type LonghornUpdateInfo');
+    }
     console.debug('update: not available:', info);
     updateState.available = false;
     updateState.info = info;
@@ -155,6 +174,9 @@ async function getUpdater(): Promise<AppUpdater | undefined> {
     window.send('update-state', updateState);
   });
   updater.on('update-downloaded', (info) => {
+    if (!isLonghornUpdateInfo(info)) {
+      throw new Error('updater: event update-downloaded: info is not of type LonghornUpdateInfo');
+    }
     if (state === State.DOWNLOADING) {
       state = State.UPDATE_PENDING;
     }
@@ -172,7 +194,7 @@ async function getUpdater(): Promise<AppUpdater | undefined> {
 }
 
 mainEvent.on('settings-update', (settings: Settings) => {
-  if (settings.updater && state === State.CONFIGURED) {
+  if (settings.application.updater.enabled && state === State.CONFIGURED) {
     // We have a configured updater, but haven't done the actual check yet.
     // This means the setting was disabled when we configured the updater.
     // Start checking now.
@@ -214,11 +236,19 @@ export default async function setupUpdate(enabled: boolean, doInstall = false): 
     return false;
   }
 
-  const result = await doInitialUpdateCheck(doInstall);
+  try {
+    const result = await doInitialUpdateCheck(doInstall);
 
-  state = State.CHECKED;
+    state = State.CHECKED;
 
-  return result;
+    return result;
+  } catch (ex) {
+    // If the initial update check fails, don't prevent application startup.
+    state = State.ERROR;
+    console.error(`Error setting up updater:`, ex);
+
+    return false;
+  }
 }
 
 /**
@@ -228,7 +258,7 @@ export default async function setupUpdate(enabled: boolean, doInstall = false): 
  * @returns Whether the update is being installed.
  */
 async function doInitialUpdateCheck(doInstall = false): Promise<boolean> {
-  if (doInstall && await hasQueuedUpdate()) {
+  if (doInstall && await hasQueuedUpdate() && !process.env.RD_FORCE_UPDATES_ENABLED) {
     console.log('Update is cached; forcing re-check to install.');
 
     return await new Promise((resolve) => {
@@ -266,7 +296,10 @@ async function triggerUpdateCheck() {
       return;
     }
 
-    const updateInfo = result.updateInfo as LonghornUpdateInfo;
+    if (!isLonghornUpdateInfo(result.updateInfo)) {
+      throw new Error('result.updateInfo is not of type LonghornUpdateInfo');
+    }
+    const updateInfo = result.updateInfo;
     const givenTimeDelta = (updateInfo.nextUpdateTime || 0) - Date.now();
 
     // Enforce at least one minute between checks, even if the server is reporting

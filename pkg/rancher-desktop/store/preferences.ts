@@ -2,7 +2,7 @@ import _ from 'lodash';
 
 import { ActionContext, MutationsType } from './ts-helpers';
 
-import { defaultSettings, Settings } from '@pkg/config/settings';
+import { CURRENT_SETTINGS_VERSION, defaultSettings, Settings, LockedSettingsType } from '@pkg/config/settings';
 import type { ServerState } from '@pkg/main/commandServer/httpCommandServer';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
 import { RecursiveKeys, RecursivePartial, RecursiveTypes } from '@pkg/utils/typeUtils';
@@ -18,6 +18,7 @@ interface Severities {
 interface PreferencesState {
   initialPreferences: Settings;
   preferences: Settings;
+  lockedPreferences: LockedSettingsType;
   wslIntegrations: { [distribution: string]: string | boolean};
   isPlatformWindows: boolean;
   hasError: boolean;
@@ -26,18 +27,58 @@ interface PreferencesState {
   canApply: boolean;
 }
 
-interface CommitArgs extends ServerState {
+type Credentials = Omit<ServerState, 'pid'>;
+
+interface CommitArgs extends Credentials {
   payload?: RecursivePartial<Settings>;
 }
 
-const uri = (port: number) => `http://localhost:${ port }/v0/settings`;
+const uri = (port: number, path: string) => `http://localhost:${ port }/v1/${ path }`;
 
-const proposedSettings = (port: number) => `http://localhost:${ port }/v0/propose_settings`;
+const proposedSettings = (port: number) => uri(port, 'propose_settings');
+
+const settingsUri = (port: number) => uri(port, 'settings');
+
+const lockedUri = (port: number) => uri(port, 'settings/locked');
+
+/**
+ * Normalize WSL integrations configuration.
+ * @param integrations The source collection, containing all WSL integrations.
+ * @param mode How normalization should take place.
+ *    'diff': Normalize for comparing to see if changes need to be applied.
+ *    'submit': Normalize for submitting preferences.
+ * @returns Returns a new object with normalized WSL configuration.
+ */
+const normalizeWslIntegrations = (integrations: Record<string, boolean>, mode: 'diff' | 'submit') => {
+  const normalizeFn = {
+    diff:   (entries: [string, boolean][]) => entries.filter(([, v]) => v),
+    submit: (entries: [string, boolean][]) => entries.map(([k, v]) => [k, v || null] as const),
+  }[mode];
+
+  return Object.fromEntries(normalizeFn(Object.entries(integrations)));
+};
+
+/**
+ * Normalizes preferences for consistent usage between API and UI
+ * @param preferences The preferences object to normalize.
+ * @param mode How the preferences should be normalized.
+ * @returns Returns a new object, containing normalized preferences data.
+ */
+const normalizePreferences = (preferences: Settings, mode: 'diff' | 'submit') => {
+  return {
+    ...preferences,
+    WSL: {
+      ...preferences.WSL,
+      integrations: normalizeWslIntegrations(preferences.WSL.integrations, mode),
+    },
+  };
+};
 
 export const state: () => PreferencesState = () => (
   {
     initialPreferences: _.cloneDeep(defaultSettings),
     preferences:        _.cloneDeep(defaultSettings),
+    lockedPreferences:  { },
     wslIntegrations:    { },
     isPlatformWindows:  false,
     hasError:           false,
@@ -56,6 +97,9 @@ export const mutations: MutationsType<PreferencesState> = {
   },
   SET_INITIAL_PREFERENCES(state, preferences) {
     state.initialPreferences = preferences;
+  },
+  SET_LOCKED_PREFERENCES(state, preferences) {
+    state.lockedPreferences = preferences;
   },
   SET_WSL_INTEGRATIONS(state, integrations) {
     state.wslIntegrations = integrations;
@@ -88,11 +132,11 @@ export const actions = {
     commit('SET_PREFERENCES', _.cloneDeep(preferences));
     commit('SET_INITIAL_PREFERENCES', _.cloneDeep(preferences));
   },
-  async fetchPreferences({ dispatch, commit }: PrefActionContext, args: ServerState) {
+  async fetchPreferences({ dispatch, commit }: PrefActionContext, args: Credentials) {
     const { port, user, password } = args;
 
     const response = await fetch(
-      uri(port),
+      settingsUri(port),
       {
         headers: new Headers({
           Authorization:  `Basic ${ window.btoa(`${ user }:${ password }`) }`,
@@ -110,20 +154,42 @@ export const actions = {
 
     dispatch('preferences/initializePreferences', settings, { root: true });
   },
-  async commitPreferences({ state, dispatch }: PrefActionContext, args: CommitArgs) {
+  async fetchLocked({ dispatch, commit }: PrefActionContext, args: Credentials) {
+    const { port, user, password } = args;
+
+    const response = await fetch(
+      lockedUri(port),
+      {
+        headers: new Headers({
+          Authorization:  `Basic ${ window.btoa(`${ user }:${ password }`) }`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        }),
+      });
+
+    if (!response.ok) {
+      commit('SET_HAS_ERROR', true);
+
+      return;
+    }
+
+    const settings: Settings = await response.json();
+
+    commit('SET_LOCKED_PREFERENCES', settings);
+  },
+  async commitPreferences({ dispatch, getters }: PrefActionContext, args: CommitArgs) {
     const {
       port, user, password, payload,
     } = args;
 
     await fetch(
-      uri(port),
+      settingsUri(port),
       {
         method:  'PUT',
         headers: new Headers({
           Authorization:  `Basic ${ window.btoa(`${ user }:${ password }`) }`,
           'Content-Type': 'application/x-www-form-urlencoded',
         }),
-        body: JSON.stringify(payload ?? state.preferences),
+        body: JSON.stringify(payload ?? normalizePreferences(getters.getPreferences, 'submit')),
       });
 
     await dispatch(
@@ -144,25 +210,31 @@ export const actions = {
   }: PrefActionContext, args: {property: P, value: RecursiveTypes<Settings>[P]}): Promise<void> {
     const { property, value } = args;
 
-    const newPreferences = _.set(_.cloneDeep(state.preferences), property, value);
+    commit('SET_PREFERENCES', _.set(_.cloneDeep(state.preferences), property, value));
 
     await dispatch(
       'preferences/proposePreferences',
-      {
-        ...rootState.credentials.credentials as ServerState,
-        preferences: newPreferences,
-      },
+      { ...rootState.credentials.credentials as Credentials },
       { root: true },
     );
-    commit('SET_PREFERENCES', newPreferences);
   },
-  setWslIntegrations({ commit }: PrefActionContext, integrations: { [distribution: string]: string | boolean}) {
-    commit('SET_WSL_INTEGRATIONS', integrations);
+  setWslIntegrations({ commit, state }: PrefActionContext, integrations: { [distribution: string]: string | boolean}) {
+    /**
+     * Merge integrations if they exist during initialization.
+     *
+     * Issue #3232: First-time render of tabs causes the entire DOM tree to
+     * refresh, causing Preferences to initialize more than once.
+     */
+    const updatedIntegrations = _.merge({}, integrations, state.wslIntegrations);
+
+    commit('SET_WSL_INTEGRATIONS', updatedIntegrations);
   },
   updateWslIntegrations({ commit, state }: PrefActionContext, args: {distribution: string, value: boolean}) {
     const { distribution, value } = args;
 
-    commit('SET_WSL_INTEGRATIONS', _.set(_.cloneDeep(state.wslIntegrations), distribution, value));
+    const integrations = _.set(_.cloneDeep(state.wslIntegrations), distribution, value);
+
+    commit('SET_WSL_INTEGRATIONS', integrations);
   },
   setPlatformWindows({ commit }: PrefActionContext, isPlatformWindows: boolean) {
     commit('SET_IS_PLATFORM_WINDOWS', isPlatformWindows);
@@ -175,15 +247,15 @@ export const actions = {
    * optional preferences object. Defaults to preferences stored in state if
    * preferences are not provided.
    * @returns A collection of severities to indicate any errors or side-effects
-   * associated with the the preferences.
+   * associated with the preferences.
    */
   async proposePreferences(
-    { commit, state }: PrefActionContext,
+    { commit, state, getters }: PrefActionContext,
     {
       port, user, password, preferences,
     }: ProposePreferencesPayload,
   ): Promise<Severities> {
-    const proposal = preferences || state.preferences;
+    const proposal = preferences || normalizePreferences(getters.getPreferences, 'submit');
 
     const result = await fetch(
       proposedSettings(port),
@@ -222,8 +294,11 @@ export const actions = {
     await dispatch(
       'preferences/commitPreferences',
       {
-        ...rootState.credentials.credentials as ServerState,
-        payload: { diagnostics: { showMuted: isMuted } },
+        ...rootState.credentials.credentials as Credentials,
+        payload: {
+          version:     CURRENT_SETTINGS_VERSION,
+          diagnostics: { showMuted: isMuted },
+        },
       },
       { root: true },
     );
@@ -238,7 +313,10 @@ export const getters: GetterTree<PreferencesState, PreferencesState> = {
     return state.preferences;
   },
   isPreferencesDirty(state: PreferencesState) {
-    const isDirty = !_.isEqual(state.initialPreferences, state.preferences);
+    const isDirty = !_.isEqual(
+      normalizePreferences(state.initialPreferences, 'diff'),
+      normalizePreferences(state.preferences, 'diff'),
+    );
 
     ipcRenderer.send('preferences-set-dirty', isDirty);
 
@@ -258,5 +336,8 @@ export const getters: GetterTree<PreferencesState, PreferencesState> = {
   },
   showMuted(state: PreferencesState) {
     return state.preferences.diagnostics.showMuted;
+  },
+  isPreferenceLocked: (state: PreferencesState) => (value: string) => {
+    return _.get(state.lockedPreferences, value);
   },
 };

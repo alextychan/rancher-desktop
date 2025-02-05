@@ -18,6 +18,9 @@ package cmd
 
 import (
 	"fmt"
+
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/client"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/config"
 	"github.com/spf13/cobra"
 )
 
@@ -45,5 +48,11 @@ func init() {
 }
 
 func getListSettings() ([]byte, error) {
-	return processRequestForUtility(doRequest("GET", versionCommand("", "settings")))
+	connectionInfo, err := config.GetConnectionInfo(false)
+	if err != nil {
+		return []byte{}, fmt.Errorf("failed to get connection info: %w", err)
+	}
+	rdClient := client.NewRDClient(connectionInfo)
+	command := client.VersionCommand("", "settings")
+	return client.ProcessRequestForUtility(rdClient.DoRequest("GET", command))
 }

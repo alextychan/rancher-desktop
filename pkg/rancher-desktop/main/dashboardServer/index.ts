@@ -3,9 +3,9 @@ import net from 'net';
 import path from 'path';
 
 import express from 'express';
-import { createProxyMiddleware, Options, RequestHandler } from 'http-proxy-middleware';
+import { createProxyMiddleware, Options } from 'http-proxy-middleware';
 
-import { proxyWsOpts, proxyOpts, proxyMetaOpts } from './proxyUtils';
+import { proxyWsOpts, proxyOpts } from './proxyUtils';
 
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
@@ -30,20 +30,22 @@ export class DashboardServer {
 
   private proxies = (() => {
     const proxy: Record<ProxyKeys, Options> = {
-      '/k8s':       proxyWsOpts(this.api), // Straight to a remote cluster (/k8s/clusters/<id>/)
-      '/pp':        proxyWsOpts(this.api), // For (epinio) standalone API
-      '/api':       proxyWsOpts(this.api), // Management k8s API
-      '/apis':      proxyWsOpts(this.api), // Management k8s API
-      '/v1':        proxyWsOpts(this.api), // Management Steve API
-      '/v3':        proxyWsOpts(this.api), // Rancher API
-      '/v3-public': proxyOpts(this.api), // Rancher Unauthed API
-      '/api-ui':    proxyOpts(this.api), // Browser API UI
-      '/meta':      proxyMetaOpts(this.api), // Browser API UI
-      '/v1-*':      proxyOpts(this.api), // SAML, KDM, etc
+      '/k8s':       proxyWsOpts, // Straight to a remote cluster (/k8s/clusters/<id>/)
+      '/pp':        proxyWsOpts, // For (epinio) standalone API
+      '/api':       proxyWsOpts, // Management k8s API
+      '/apis':      proxyWsOpts, // Management k8s API
+      '/v1':        proxyWsOpts, // Management Steve API
+      '/v3':        proxyWsOpts, // Rancher API
+      '/api-ui':    proxyOpts, // Browser API UI
+      '/v3-public': proxyOpts, // Rancher Unauthed API
+      '/meta':      proxyOpts, // Browser API UI
+      '/v1-*':      proxyOpts, // SAML, KDM, etc
     };
+    const entries = Object.entries(proxy).map(([key, options]) => {
+      return [key, createProxyMiddleware({ ...options, target: this.api + key })] as const;
+    });
 
-    return Object.fromEntries(Object.entries(proxy)
-      .map(([key, options]) => [key, createProxyMiddleware(options)])) as unknown as Record<ProxyKeys, RequestHandler>;
+    return Object.fromEntries(entries);
   })();
 
   /**
@@ -88,16 +90,19 @@ export class DashboardServer {
           );
         })
       .listen(this.port, this.host)
-      .on('upgrade', (incomingMessage, duplex, head) => {
-        const req = incomingMessage as express.Request;
-        const socket = duplex as net.Socket;
+      .on('upgrade', (req, socket, head) => {
+        if (!(socket instanceof net.Socket)) {
+          console.log(`Invalid upgrade for ${ req.url }`);
 
-        if (req?.url?.startsWith('/v1')) {
-          return this.proxies['/v1'].upgrade?.(req, socket, head);
-        } else if (req?.url?.startsWith('/v3')) {
-          return this.proxies['/v3'].upgrade?.(req, socket, head);
-        } else if (req?.url?.startsWith('/k8s/')) {
-          return this.proxies['/k8s'].upgrade?.(req, socket, head);
+          return;
+        }
+
+        if (req.url?.startsWith('/v1')) {
+          return this.proxies['/v1'].upgrade(req, socket, head);
+        } else if (req.url?.startsWith('/v3')) {
+          return this.proxies['/v3'].upgrade(req, socket, head);
+        } else if (req.url?.startsWith('/k8s/')) {
+          return this.proxies['/k8s'].upgrade(req, socket, head);
         } else {
           console.log(`Unknown Web socket upgrade request for ${ req.url }`);
         }

@@ -1,19 +1,26 @@
 <script lang="ts">
-import { Checkbox, StringList } from '@rancher/components';
-import Vue from 'vue';
 
+import { StringList } from '@rancher/components';
+import Vue, { VueConstructor } from 'vue';
+import { mapGetters } from 'vuex';
+
+import RdCheckbox from '@pkg/components/form/RdCheckbox.vue';
 import RdFieldset from '@pkg/components/form/RdFieldset.vue';
 import { Settings } from '@pkg/config/settings';
 import { RecursiveTypes } from '@pkg/utils/typeUtils';
 
 import type { PropType } from 'vue';
 
-export default Vue.extend({
+interface VuexBindings {
+  isPreferenceLocked(path: string): boolean;
+}
+
+export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
   name:       'preferences-container-engine-allowed-images',
   components: {
-    Checkbox,
     RdFieldset,
     StringList,
+    RdCheckbox,
   },
   props: {
     preferences: {
@@ -22,19 +29,17 @@ export default Vue.extend({
     },
   },
   computed: {
-    patterns() {
-      return this.preferences.containerEngine.imageAllowList.patterns;
+    ...mapGetters('preferences', ['isPreferenceLocked']),
+    patterns(): string[] {
+      return this.preferences.containerEngine.allowedImages.patterns;
     },
     isAllowedImagesEnabled(): boolean {
-      return this.preferences.containerEngine.imageAllowList.enabled;
+      return this.preferences.containerEngine.allowedImages.enabled;
     },
-    isAllowedImagesLocked(): boolean {
-      return this.preferences.containerEngine.imageAllowList.locked;
+    isPatternsFieldLocked(): boolean {
+      return this.isPreferenceLocked('containerEngine.allowedImages.patterns') || !this.isAllowedImagesEnabled;
     },
-    allowedImagesLockedTooltip() {
-      return this.t('allowedImages.locked.tooltip');
-    },
-    patternsErrorMessages() {
+    patternsErrorMessages(): { duplicate: string } {
       return { duplicate: this.t('allowedImages.errors.duplicate') };
     },
   },
@@ -43,7 +48,7 @@ export default Vue.extend({
       this.$store.dispatch('preferences/updatePreferencesData', { property, value });
     },
     onType(item: string) {
-      if (item !== null) {
+      if (item) {
         this.setCanApply(item.trim().length > 0);
       }
     },
@@ -60,38 +65,24 @@ export default Vue.extend({
 </script>
 
 <template>
-  <div
-    class="container-engine-allowed-images"
-  >
-    <rd-fieldset
-      data-test="allowedImages"
-      :legend-text="t('allowedImages.label')"
-    >
-      <checkbox
+  <div class="container-engine-allowed-images">
+    <rd-fieldset data-test="allowedImages" :legend-text="t('allowedImages.label')" :is-experimental="true">
+      <rd-checkbox
+        data-testid="allowedImagesCheckbox"
         :label="t('allowedImages.enable')"
         :value="isAllowedImagesEnabled"
-        :class="{
-          'disabled': isAllowedImagesLocked
-        }"
-        @input="onChange('containerEngine.imageAllowList.enabled', $event)"
-      />
-      <i
-        v-if="isAllowedImagesLocked"
-        v-tooltip="{
-          content: allowedImagesLockedTooltip,
-          placement: 'right'
-        }"
-        class="icon icon-lock icon-lg"
+        :is-locked="isPreferenceLocked('containerEngine.allowedImages.enabled')"
+        @input="onChange('containerEngine.allowedImages.enabled', $event)"
       />
     </rd-fieldset>
     <string-list
       :items="patterns"
       :case-sensitive="false"
       :placeholder="t('allowedImages.patterns.placeholder')"
-      :readonly="!isAllowedImagesEnabled || isAllowedImagesLocked"
+      :readonly="isPatternsFieldLocked"
       :actions-position="'left'"
       :error-messages="patternsErrorMessages"
-      @change="onChange('containerEngine.imageAllowList.patterns', $event)"
+      @change="onChange('containerEngine.allowedImages.patterns', $event)"
       @type:item="onType($event)"
       @errors="onDuplicate($event.duplicate)"
     />
@@ -109,17 +100,6 @@ export default Vue.extend({
     .string-list {
       height: 220px;
     }
-  }
-
-  .disabled {
-    cursor: default;
-    pointer-events: none;
-    opacity: 0.4;
-  }
-
-  .icon-lock {
-    vertical-align: 2%;
-    color: var(--warning);
   }
 
 </style>
