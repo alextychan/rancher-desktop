@@ -14,6 +14,10 @@ export default {
       type:    Boolean,
       default: false,
     },
+    isLocked: {
+      type:    Boolean,
+      default: false,
+    },
   },
   computed: {
     options() {
@@ -41,9 +45,11 @@ export default {
     <radio-group
       name="containerEngine"
       class="container-engine"
+      :class="{ 'locked-radio' : isLocked }"
       :value="containerEngine"
       :options="options"
       :row="row"
+      :disabled="isLocked"
       @input="updateEngine"
     >
       <template #label>

@@ -2,13 +2,14 @@
  * Helpers for downloading files.
  */
 
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import stream from 'stream';
 
-import fetch from 'node-fetch';
+import { simpleSpawn } from 'scripts/simple_process';
 
 type ChecksumAlgorithm = 'sha1' | 'sha256' | 'sha512';
 
@@ -19,6 +20,8 @@ export type DownloadOptions = {
   overwrite?: boolean;
   // The file mode required.
   access?: number;
+  // The file needs a new ad-hoc signature.
+  codesign?: boolean;
 };
 
 export type ArchiveDownloadOptions = DownloadOptions & {
@@ -29,7 +32,7 @@ export type ArchiveDownloadOptions = DownloadOptions & {
 async function fetchWithRetry(url: string) {
   while (true) {
     try {
-      return await fetch(url);
+      return await fetch(url, { redirect: 'follow' });
     } catch (ex: any) {
       if (ex && ex.errno === 'EAI_AGAIN') {
         console.log(`Recoverable error downloading ${ url }, retrying...`);
@@ -72,14 +75,15 @@ export async function download(url: string, destPath: string, options: DownloadO
   if (!response.ok) {
     throw new Error(`Error downloading ${ url }: ${ response.statusText }`);
   }
+  if (!response.body) {
+    throw new Error(`Error downloading ${ url }: did not receive response body`);
+  }
   const tempPath = `${ destPath }.download`;
 
   try {
     const file = fs.createWriteStream(tempPath);
-    const promise = new Promise(resolve => file.on('finish', resolve));
 
-    response.body.pipe(file);
-    await promise;
+    await response.body.pipeTo(stream.Writable.toWeb(file));
 
     if (expectedChecksum) {
       const actualChecksum = await getChecksumForFile(tempPath, checksumAlgorithm);
@@ -101,6 +105,14 @@ export async function download(url: string, destPath: string, options: DownloadO
         console.error(ex);
       }
     }
+  }
+
+  if (options.codesign) {
+    spawnSync(
+      'codesign',
+      ['--force', '--sign', '-', destPath],
+      { stdio: 'inherit' },
+    );
   }
 }
 
@@ -167,7 +179,7 @@ export async function downloadTarGZ(url: string, destPath: string, options: Arch
 
   try {
     const tgzPath = path.join(workDir, `${ binaryBasename }.tar.gz`);
-    const args = ['tar', '-zxvf', tgzPath, '--directory', workDir, fileToExtract];
+    const args = ['tar', '-zxf', tgzPath, '--directory', workDir, fileToExtract];
     const mode =
             (access & fs.constants.X_OK) ? 0o755 : (access & fs.constants.W_OK) ? 0o644 : 0o444;
 
@@ -183,9 +195,10 @@ export async function downloadTarGZ(url: string, destPath: string, options: Arch
       }
       args[0] = path.join(systemRoot, 'system32', 'tar.exe');
     }
-    execFileSync(args[0], args.slice(1), { stdio: 'inherit' });
-    fs.copyFileSync(path.join(workDir, fileToExtract), destPath);
-    fs.chmodSync(destPath, mode);
+    await simpleSpawn(args[0], args.slice(1));
+    await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+    await fs.promises.copyFile(path.join(workDir, fileToExtract), destPath);
+    await fs.promises.chmod(destPath, mode);
   } finally {
     fs.rmSync(workDir, { recursive: true, maxRetries: 10 });
   }
@@ -226,7 +239,7 @@ export async function downloadZip(url: string, destPath: string, options: Archiv
 
   try {
     const zipPath = path.join(workDir, `${ binaryBasename }.zip`);
-    const args = ['unzip', '-o', zipPath, fileToExtract, '-d', workDir];
+    const args = ['unzip', '-q', '-o', zipPath, fileToExtract, '-d', workDir];
 
     await download(url, zipPath, { ...options, access: fs.constants.W_OK });
     execFileSync(args[0], args.slice(1), { stdio: 'inherit' });

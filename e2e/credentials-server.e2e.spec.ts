@@ -25,21 +25,19 @@ import os from 'os';
 import path from 'path';
 import process from 'process';
 import stream from 'stream';
-import util from 'util';
 
 import { findHomeDir } from '@kubernetes/client-node';
 import { expect, test } from '@playwright/test';
 import fetch from 'node-fetch';
-import { BrowserContext, ElectronApplication, Page, _electron } from 'playwright';
 
 import { NavPage } from './pages/nav-page';
-import {
-  createDefaultSettings, getFullPathForTool, packageLogs, reportAsset, tool,
-} from './utils/TestUtils';
+import { getFullPathForTool, startSlowerDesktop, teardown, tool } from './utils/TestUtils';
 
 import { ServerState } from '@pkg/main/commandServer/httpCommandServer';
 import { spawnFile } from '@pkg/utils/childProcess';
 import paths from '@pkg/utils/paths';
+
+import type { ElectronApplication, Page } from '@playwright/test';
 
 let credStore = '';
 let dockerConfigPath = '';
@@ -90,9 +88,9 @@ function haveCredentialServerHelper(): boolean {
 
     return !result.error;
   } catch (err: any) {
-    if (err.code === 'ENOENT' && process.env.CIRRUS_CI) {
+    if (err.code === 'ENOENT' && process.env.CI) {
       try {
-        console.log('Attempting to set up docker-credential-none on CIRRUS CI.');
+        console.log('Attempting to set up docker-credential-none on CI.');
         fs.mkdirSync(dockerDir, { recursive: true });
         fs.writeFileSync(dockerConfigPath, JSON.stringify({ credsStore: 'none' }, undefined, 2));
 
@@ -108,16 +106,13 @@ function haveCredentialServerHelper(): boolean {
 
 const describeWithCreds = haveCredentialServerHelper() ? test.describe : test.describe.skip;
 const describeCredHelpers = credStore === 'none' ? test.describe.skip : test.describe;
-const testWin32 = os.platform() === 'win32' ? test : test.skip;
 const testUnix = os.platform() === 'win32' ? test.skip : test;
 
 describeWithCreds('Credentials server', () => {
   let electronApp: ElectronApplication;
-  let context: BrowserContext;
   let serverState: ServerState;
   let authString: string;
   let page: Page;
-  const appPath = path.join(__dirname, '../');
   const curlCommand = os.platform() === 'win32' ? 'curl.exe' : 'curl';
   const initialArgs: string[] = []; // Assigned once we have auth string on first use.
 
@@ -225,40 +220,20 @@ describeWithCreds('Credentials server', () => {
 
   test.describe.configure({ mode: 'serial' });
 
-  test.beforeAll(async() => {
-    createDefaultSettings({ kubernetes: { enabled: false } });
-    electronApp = await _electron.launch({
-      args: [
-        appPath,
-        '--disable-gpu',
-        '--whitelisted-ips=',
-        // See pkg/rancher-desktop/utils/commandLine.ts before changing the next item.
-        '--disable-dev-shm-usage',
-        '--no-modal-dialogs',
-      ],
-      env: {
-        ...process.env,
-        RD_LOGS_DIR: reportAsset(__filename, 'log'),
-      },
-    });
-    context = electronApp.context();
-
-    await context.tracing.start({
-      screenshots: true,
-      snapshots:   true,
-    });
-    page = await electronApp.firstWindow();
+  test.beforeAll(async({ colorScheme }, testInfo) => {
+    await tool('rdctl', 'factory-reset', '--verbose');
+    [electronApp, page] = await startSlowerDesktop(testInfo, { kubernetes: { enabled: false } });
   });
 
   test.afterAll(async() => {
-    if (originalDockerConfigContents !== undefined && !process.env.CIRRUS_CI && !process.env.RD_E2E_DO_NOT_RESTORE_CONFIG) {
+    if (originalDockerConfigContents !== undefined && !process.env.CI && !process.env.RD_E2E_DO_NOT_RESTORE_CONFIG) {
       try {
         await fs.promises.writeFile(dockerConfigPath, originalDockerConfigContents);
       } catch (e: any) {
         console.error(`Failed to restore config file ${ dockerConfigPath }: `, e);
       }
     }
-    if (originalPlaintextConfigContents !== undefined && !process.env.CIRRUS_CI && !process.env.RD_E2E_DO_NOT_RESTORE_CONFIG) {
+    if (originalPlaintextConfigContents !== undefined && !process.env.CI && !process.env.RD_E2E_DO_NOT_RESTORE_CONFIG) {
       try {
         await fs.promises.writeFile(plaintextConfigPath, originalPlaintextConfigContents);
       } catch (e: any) {
@@ -267,11 +242,7 @@ describeWithCreds('Credentials server', () => {
     }
   });
 
-  test.afterAll(async() => {
-    await context.tracing.stop({ path: reportAsset(__filename) });
-    await packageLogs(__filename);
-    await electronApp.close();
-  });
+  test.afterAll(({ colorScheme }, testInfo) => teardown(electronApp, testInfo));
 
   test('should start loading the background services and hide progress bar', async() => {
     const navPage = new NavPage(page);
@@ -307,7 +278,7 @@ describeWithCreds('Credentials server', () => {
   });
 
   test('should require authentication', async() => {
-    const url = `http://localhost:${ serverState.port }/list`;
+    const url = `http://127.0.0.1:${ serverState.port }/list`;
     const resp = await fetch(url);
 
     expect(resp.ok).toBeFalsy();
@@ -355,28 +326,8 @@ describeWithCreds('Credentials server', () => {
       expect(stdout).toContain('credentials not found in native keychain');
     }
 
-    // Don't bother trying to test erasing a non-existent credential, because the
+    // Don't bother trying to test erasing a nonexistent credential, because the
     // behavior is all over the place. Fails with osxkeychain, succeeds with wincred.
-  });
-
-  // On Windows, we need to wait for the vtunnel proxy to be established.
-  testWin32('ensure vtunnel proxy is ready', async() => {
-    const args = ['--distribution', 'rancher-desktop', '--exec',
-      'curl', '--verbose', '--user', `${ serverState.user }:${ serverState.password }`,
-      'http://localhost:3030/'];
-
-    for (let attempt = 0; attempt < 30; ++attempt) {
-      try {
-        await spawnFile('wsl.exe', args);
-        break;
-      } catch (ex: any) {
-        if (ex.code !== 56) {
-          throw ex;
-        }
-        console.debug(`Attempt ${ attempt } failed with ${ ex }, retrying...`);
-        await util.promisify(setTimeout)(1_000);
-      }
-    }
   });
 
   test('it should complain about an unrecognized command', async() => {
@@ -542,6 +493,7 @@ describeWithCreds('Credentials server', () => {
         'https://bobs.fish/clams05': 'none',
       },
     };
+    let existingDockerConfig: Buffer | undefined;
 
     test.beforeAll(async() => {
       const platform = os.platform();
@@ -555,7 +507,22 @@ describeWithCreds('Credentials server', () => {
       } else {
         throw new Error(`Unexpected platform of ${ platform }`);
       }
+      try {
+        existingDockerConfig = await fs.promises.readFile(dockerConfigPath);
+      } catch (ex) {
+        if (Object(ex).code !== 'ENOENT') {
+          throw ex;
+        }
+      }
       await fs.promises.writeFile(dockerConfigPath, JSON.stringify(dockerConfig, undefined, 2));
+    });
+
+    test.afterAll(async() => {
+      if (existingDockerConfig) {
+        await fs.promises.writeFile(dockerConfigPath, existingDockerConfig);
+      } else {
+        await fs.promises.unlink(dockerConfigPath);
+      }
     });
 
     // removeEntries and addEntry return Promise<void>,

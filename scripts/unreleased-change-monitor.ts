@@ -1,10 +1,10 @@
 import { Octokit } from 'octokit';
 
-import { LimaAndQemu, AlpineLimaISO } from 'scripts/dependencies/lima';
+import { Lima, Qemu, AlpineLimaISO } from 'scripts/dependencies/lima';
 import * as tools from 'scripts/dependencies/tools';
-import { WSLDistro, HostResolverHost } from 'scripts/dependencies/wsl';
+import { WSLDistro } from 'scripts/dependencies/wsl';
 import {
-  Dependency, GithubDependency, HasUnreleasedChangesResult, getOctokit, RancherDesktopRepository,
+  Dependency, GitHubDependency, HasUnreleasedChangesResult, getOctokit, RancherDesktopRepository,
 } from 'scripts/lib/dependencies';
 
 const GITHUB_OWNER = process.env.GITHUB_REPOSITORY?.split('/')[0] || 'rancher-sandbox';
@@ -14,19 +14,18 @@ const GITHUB_REPO = process.env.GITHUB_REPOSITORY?.split('/')[1] || 'rancher-des
 const UCMONITOR = 'ucmonitor';
 const mainRepo = new RancherDesktopRepository(GITHUB_OWNER, GITHUB_REPO);
 
-type UnreleasedChangeMonitoringDependency = Dependency & GithubDependency;
+type UnreleasedChangeMonitoringDependency = Dependency & GitHubDependency;
 
 type DependencyState = { dependency: UnreleasedChangeMonitoringDependency } & HasUnreleasedChangesResult;
 
 const dependencies: UnreleasedChangeMonitoringDependency[] = [
-  new LimaAndQemu(),
+  new Lima(),
+  new Qemu(),
   new WSLDistro(),
   new tools.DockerCLI(),
   new tools.Steve(),
-  new tools.GuestAgent(),
   new tools.RancherDashboard(),
   new AlpineLimaISO(),
-  new HostResolverHost(), // we only need one of HostResolverHost and HostResolverPeer
 ];
 
 type Issue = Awaited<ReturnType<Octokit['rest']['search']['issuesAndPullRequests']>>['data']['items'][0];
@@ -42,7 +41,7 @@ async function getExistingIssuesFor(dependencyName: string): Promise<Issue[]> {
  * Tells the caller whether the given dependency has any
  * changes that have not been released.
  */
-export async function hasUnreleasedChanges(dependency: Dependency & GithubDependency): Promise<HasUnreleasedChangesResult> {
+export async function hasUnreleasedChanges(dependency: Dependency & GitHubDependency): Promise<HasUnreleasedChangesResult> {
   const availableVersions = await dependency.getAvailableVersions();
   const sortedVersions = availableVersions.sort((version1, version2) => {
     return dependency.rcompareVersions(version1, version2);
@@ -64,7 +63,9 @@ export async function hasUnreleasedChanges(dependency: Dependency & GithubDepend
   });
   const commits = response.data;
 
-  console.log(`Found ${ commits.length - 1 } unreleased commits for repository ${ dependency.githubOwner }/${ dependency.githubRepo }.`);
+  console.log(`Found ${ commits.length - 1 } unreleased commits ` +
+              `for repository ${ dependency.githubOwner }/${ dependency.githubRepo } ` +
+              `since ${ JSON.stringify(latestVersion) } (${ latestTagName }).`);
 
   return {
     latestReleaseTag:     latestTagName,
@@ -73,7 +74,7 @@ export async function hasUnreleasedChanges(dependency: Dependency & GithubDepend
 }
 
 // Creates issues in the main Rancher Desktop repo for external
-// depndencies that have changes that have not been released.
+// dependencies that have changes that have not been released.
 // Also closes issues that were previously created by this script,
 // but that are no longer relevant.
 async function checkForUnreleasedChanges(): Promise<void> {

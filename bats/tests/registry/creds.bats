@@ -1,150 +1,269 @@
-setup() {
-    load '../helpers/load'
-    REGISTRY_IMAGE=registry:2.8.1
-    REGISTRY_HOST=registry.internal
-    REGISTRY_PORT=5050
-    REGISTRY=$REGISTRY_HOST:$REGISTRY_PORT
+load '../helpers/load'
 
-    AUTH_DIR=/tmp/auth
-    CAROOT=/tmp/caroot
-    CERTS_DIR=/tmp/certs
-}
-
-@test 'factory reset' {
-    factory_reset
-}
-
-@test 'start container runtime' {
-    # $RDCTL start \
-    #        --container-engine "$RD_CONTAINER_RUNTIME" \
-    #        --kubernetes-enabled=false \  <=== broken in 1.4.1
-    #        --suppress-sudo               <=== not implemented
-    start_container_runtime
-    # we rely on start_container_runtime to have added $REGISTRY_HOST to host
-    # resover config because it is not configurable via settings, and openresty
-    # will no use /etc/hosts to resolve upstream registry names.
-    wait_for_shell
-    if [ "${RD_USE_IMAGE_ALLOW_LIST}" != "false" ]; then
-        $RDCTL api -X PUT -b "{\"containerEngine\":{\"imageAllowList\":{\"enabled\":true,\"patterns\":[\"$REGISTRY\",\"docker.io/registry\"]}}}" settings
+local_setup() {
+    REGISTRY_PORT="5050"
+    if is_windows && ! using_windows_exe; then
+        # TODO TODO TODO
+        # RD will only modify the Windows version of .docker/config.json;
+        # there is no WSL integration support for it. Therefore this test
+        # always needs to modify the Windows version and not touch the
+        # Linux one. This may change depending on:
+        # https://github.com/rancher-sandbox/rancher-desktop/issues/5523
+        # TODO TODO TODO
+        USERPROFILE="$(wslpath_from_win32_env USERPROFILE)"
     fi
-}
+    DOCKER_CONFIG_FILE="$USERPROFILE/.docker/config.json"
 
-@test 'verify image-allow-list config' {
-    wait_for_container_runtime
-    run $CRCTL pull busybox
-    if [ "${RD_USE_IMAGE_ALLOW_LIST}" == "false" ]; then
-        assert_success
+    TEMP=/tmp
+    if is_windows; then
+        # We need to use a directory that exists on the Win32 filesystem
+        # so the ctrctl clients can correctly map the bind mounts.
+        # We can use host_path() on these paths because they will exist
+        # both here and in the rancher-desktop distro.
+        TEMP="$(wslpath_from_win32_env TEMP)"
+    fi
+
+    AUTH_DIR="$TEMP/auth"
+    CAROOT="$TEMP/caroot"
+    CERTS_DIR="$TEMP/certs"
+
+    if is_windows && using_docker; then
+        # BUG BUG BUG
+        # docker service on Windows cannot be restarted, so we can't register
+        # a new CA. `localhost` is an insecure registry, not requiring certs.
+        # https://github.com/rancher-sandbox/rancher-desktop/issues/3878
+        # BUG BUG BUG
+        REGISTRY_HOST="localhost"
     else
-        assert_failure
-        assert_output --regexp "(unauthorized|Forbidden)"
+        # Determine IP address of the VM that is routable inside the VM itself.
+        # Essentially localhost, but needs to be a routable IP that also works
+        # from inside a container. Will be turned into a DNS name using sslip.io.
+        if is_windows; then
+            ipaddr="192.168.143.1"
+        else
+            # Lima uses a fixed hard-coded IP address
+            ipaddr="192.168.5.15"
+        fi
+        REGISTRY_HOST="registry.$ipaddr.sslip.io"
     fi
-}
-
-@test 'configure registry hostname' {
-    $RDSUDO sh -c "printf '%s\t%s\n' \$(hostname -i) $REGISTRY_HOST >> /etc/hosts"
-    # $RDSHELL cat /etc/hosts >&3
-}
-
-@test 'create server certs for registry' {
-    $RDSUDO apk add mkcert --force-broken-world --repository https://dl-cdn.alpinelinux.org/alpine/edge/testing
-    $RDSHELL mkdir -p $CAROOT
-    $RDSHELL CAROOT=$CAROOT TRUST_STORES=none mkcert -install
-    $RDSHELL sh -c "mkdir -p $CERTS_DIR; cd $CERTS_DIR; CAROOT=$CAROOT mkcert $REGISTRY_HOST"
+    REGISTRY="$REGISTRY_HOST:$REGISTRY_PORT"
 }
 
 create_registry() {
-    wait_for_container_runtime
-    run $CRCTL rm -f registry
-    $CRCTL run \
-           --detach \
-           --name registry \
-           --restart always \
-           -p $REGISTRY_PORT:$REGISTRY_PORT \
-           -e REGISTRY_HTTP_ADDR=0.0.0.0:$REGISTRY_PORT \
-           -v "$CERTS_DIR:/certs" \
-           -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/$REGISTRY_HOST.pem \
-           -e REGISTRY_HTTP_TLS_KEY=/certs/$REGISTRY_HOST-key.pem \
-           "$@" \
-           $REGISTRY_IMAGE
+    run ctrctl rm -f registry
+    assert_nothing
+    rdshell mkdir -p "$CERTS_DIR"
+    ctrctl run \
+        --detach \
+        --name registry \
+        --restart always \
+        -p "$REGISTRY_PORT:$REGISTRY_PORT" \
+        -e "REGISTRY_HTTP_ADDR=0.0.0.0:$REGISTRY_PORT" \
+        -v "$(host_path "$CERTS_DIR"):/certs" \
+        -e "REGISTRY_HTTP_TLS_CERTIFICATE=/certs/$REGISTRY_HOST.pem" \
+        -e "REGISTRY_HTTP_TLS_KEY=/certs/$REGISTRY_HOST-key.pem" \
+        "$@" \
+        "$IMAGE_REGISTRY"
     wait_for_registry
 }
 
 wait_for_registry() {
     # registry port is forwarded to host
-    try --max 10 --delay 5 curl -k --silent --show-error https://localhost:$REGISTRY_PORT/v2/_catalog
+    try --max 10 --delay 5 curl -k --silent --show-error "https://localhost:$REGISTRY_PORT/v2/_catalog"
+}
+
+using_insecure_registry() {
+    [ "$REGISTRY_HOST" = "localhost" ]
+}
+
+skip_for_insecure_registry() {
+    if using_insecure_registry; then
+        skip "BUG: docker on Windows can only use insecure registry"
+    fi
+}
+
+@test 'factory reset' {
+    factory_reset
+    rm -f "$DOCKER_CONFIG_FILE"
+}
+
+@test 'start container engine' {
+    start_container_engine
+
+    wait_for_shell
+    for dir in "$AUTH_DIR" "$CAROOT" "$CERTS_DIR"; do
+        rdshell rm -rf "$dir"
+    done
+
+    if using_image_allow_list; then
+        update_allowed_patterns true "$IMAGE_REGISTRY" "$REGISTRY"
+    fi
+}
+
+@test 'wait for container engine' {
+    wait_for_container_engine
+}
+
+@test 'verify credential is set correctly' {
+    verify_default_credStore
+}
+
+verify_default_credStore() {
+    local CREDHELPER_NAME
+    CREDHELPER_NAME="$(basename "$CRED_HELPER" .exe | sed s/^docker-credential-//)"
+    run jq --raw-output .credsStore "$DOCKER_CONFIG_FILE"
+    assert_success
+    assert_output "$CREDHELPER_NAME"
+}
+
+@test 'verify allowed-images config' {
+    run ctrctl pull --quiet "$IMAGE_BUSYBOX"
+    if using_image_allow_list; then
+        assert_failure
+        assert_output --regexp "(unauthorized|Forbidden)"
+    else
+        assert_success
+    fi
+}
+
+@test 'create server certs for registry' {
+    rdsudo apk add mkcert --force-broken-world --repository https://dl-cdn.alpinelinux.org/alpine/edge/testing
+    rdshell mkdir -p "$CAROOT" "$CERTS_DIR"
+    rdshell sh -c "CAROOT=\"$CAROOT\" TRUST_STORES=none mkcert -install"
+    rdshell sh -c "cd \"$CERTS_DIR\"; CAROOT=\"$CAROOT\" mkcert \"$REGISTRY_HOST\""
+}
+
+@test 'pull registry image' {
+    ctrctl pull --quiet "$IMAGE_REGISTRY"
 }
 
 @test 'create plain registry' {
     create_registry
 }
 
+@test 'tag image with registry' {
+    ctrctl tag "$IMAGE_REGISTRY" "$REGISTRY/registry"
+}
+
 @test 'expect push image to registry to fail because CA cert has not been installed' {
-    $CRCTL tag $REGISTRY_IMAGE $REGISTRY/$REGISTRY_IMAGE
-    run $CRCTL push $REGISTRY/$REGISTRY_IMAGE
+    skip_for_insecure_registry
+
+    run ctrctl push "$REGISTRY/registry"
     assert_failure
     # we don't get cert errors when going through the proxy; they turn into 502's
     assert_output --regexp "(certificate signed by unknown authority|502 Bad Gateway)"
 }
 
 @test 'install CA cert' {
-    $RDSUDO cp "$CAROOT/rootCA.pem" /usr/local/share/ca-certificates/
-    $RDSUDO update-ca-certificates
+    skip_for_insecure_registry
+
+    rdsudo cp "$CAROOT/rootCA.pem" /usr/local/share/ca-certificates/
+    rdsudo update-ca-certificates
 }
 
-@test 'restart container runtime to refresh certs' {
-    $RDSUDO rc-service "$CR_SERVICE" restart
-    $RDSUDO rc-service --ifstarted openresty restart
-    wait_for_container_runtime
+@test 'restart container engine to refresh certs' {
+    skip_for_insecure_registry
+
+    # BUG BUG BUG
+    # When using containerd the guestagent currently doesn't enumerate
+    # running containers when it starts up to find existing open ports
+    # (it does this for moby only). Therefore it misses forwarding
+    # ports that have been opened while the guestagent was down.
+    #
+    # The guestagent would restart automatically when containerd
+    # restart. By explicitly stopping/restarting the guestagent we are
+    # more likely to have the new instance running by the time the
+    # containerd becomes ready.
+    #
+    # This workaround can be removed when the following bug has been fixed:
+    # https://github.com/rancher-sandbox/rancher-desktop/issues/7146
+    # BUG BUG BUG
+    if is_windows && using_containerd; then
+        rdsudo rc-service rancher-desktop-guestagent stop
+    fi
+
+    rdsudo rc-service "$CONTAINER_ENGINE_SERVICE" restart
+
+    # BUG BUG BUG
+    # Second part of the workaround
+    # BUG BUG BUG
+    if is_windows && using_containerd; then
+        rdsudo rc-service rancher-desktop-guestagent start
+    fi
+
+    rdsudo rc-service --ifstarted rd-openresty restart
+
+    wait_for_container_engine
     # when Moby is stopped, the containers are stopped as well
-    wait_for_registry
+    if using_docker; then
+        wait_for_registry
+    fi
 }
 
 @test 'expect push image to registry to succeed now' {
-    $CRCTL push $REGISTRY/$REGISTRY_IMAGE
+    ctrctl push "$REGISTRY/registry"
 }
 
 @test 'create registry with basic auth' {
     # note: docker htpasswd **must** use bcrypt algorithm, i.e. `htpasswd -nbB user password`
-    $RDSHELL mkdir -p $AUTH_DIR
-    $RDSHELL sh -c "echo 'user:\$2y\$05\$pd/kWjYSW9x48yaPQgrl.eLn02DdMPyoYPUy/yac601k6w.okKgmG' > $AUTH_DIR/htpasswd"
+    # We intentionally use single-quotes; the '$' characters are literals
+    # shellcheck disable=SC2016
+    HTPASSWD='user:$2y$05$pd/kWjYSW9x48yaPQgrl.eLn02DdMPyoYPUy/yac601k6w.okKgmG'
+    rdshell mkdir -p "$AUTH_DIR"
+    echo "$HTPASSWD" | rdshell tee "$AUTH_DIR/htpasswd" >/dev/null
     create_registry \
-        -v $AUTH_DIR:/auth \
+        -v "$(host_path "$AUTH_DIR"):/auth" \
         -e REGISTRY_AUTH=htpasswd \
         -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd \
         -e REGISTRY_AUTH_HTPASSWD_REALM="Registry Realm"
 }
 
 @test 'verify that registry requires basic auth' {
-    run $RDSHELL curl --silent --show-error https://$REGISTRY/v2/_catalog
+    local curl_options=(--silent --show-error)
+    if using_insecure_registry; then
+        curl_options+=(--insecure)
+    fi
+
+    local registry_url="https://$REGISTRY/v2/_catalog"
+    run rdshell curl "${curl_options[@]}" "$registry_url"
     assert_success
     assert_output --partial '"message":"authentication required"'
 
-    run $RDSHELL curl --silent --show-error --user user:password https://$REGISTRY/v2/_catalog
+    run rdshell curl "${curl_options[@]}" --user user:password "$registry_url"
     assert_success
     assert_output '{"repositories":[]}'
 }
 
 @test 'verify that pushing fails when not logged in' {
-    run bash -c "echo $REGISTRY | $CRED_HELPER erase"
-    run $CRCTL push $REGISTRY/$REGISTRY_IMAGE
+    run bash -c "echo \"$REGISTRY\" | \"$CRED_HELPER\" erase"
+    assert_nothing
+    run ctrctl push "$REGISTRY/registry"
     assert_failure
     assert_output --regexp "(401 Unauthorized|no basic auth credentials)"
 }
 
 @test 'verify that pushing succeeds after logging in' {
-    run $CRCTL login -u user -p password $REGISTRY
+    run ctrctl login -u user -p password "$REGISTRY"
     assert_success
     assert_output --partial "Login Succeeded"
 
-    $CRCTL push $REGISTRY/$REGISTRY_IMAGE
+    ctrctl push "$REGISTRY/registry"
 }
 
 @test 'verify credentials in host cred store' {
-    run bash -c "echo $REGISTRY | $CRED_HELPER get"
+    run bash -c "echo \"$REGISTRY\" | \"$CRED_HELPER\" get"
     assert_success
     assert_output --partial '"Secret":"password"'
 
-    $CRCTL logout $REGISTRY
-    run bash -c "echo $REGISTRY | $CRED_HELPER get"
+    ctrctl logout "$REGISTRY"
+    run bash -c "echo \"$REGISTRY\" | \"$CRED_HELPER\" get"
     refute_output --partial '"Secret":"password"'
+}
+
+@test 'verify the docker-desktop credential helper is replaced with the rancher-desktop default' {
+    factory_reset
+    echo '{ "credsStore": "desktop" }' >|"$DOCKER_CONFIG_FILE"
+    start_container_engine
+    wait_for_container_engine
+    verify_default_credStore
 }

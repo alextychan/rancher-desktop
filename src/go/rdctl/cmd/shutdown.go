@@ -17,20 +17,17 @@ limitations under the License.
 package cmd
 
 import (
-	"errors"
+	"context"
 	"fmt"
-	"net/url"
-	"os"
-	"strings"
 
-	rdconfig "github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/config"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/client"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/config"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/shutdown"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
 
 type shutdownSettingsStruct struct {
-	Verbose         bool
 	WaitForShutdown bool
 }
 
@@ -45,11 +42,8 @@ var shutdownCmd = &cobra.Command{
 		if err := cobra.NoArgs(cmd, args); err != nil {
 			return err
 		}
-		if commonShutdownSettings.Verbose {
-			logrus.SetLevel(logrus.TraceLevel)
-		}
 		cmd.SilenceUsage = true
-		result, err := doShutdown(&commonShutdownSettings)
+		result, err := doShutdown(cmd.Context(), &commonShutdownSettings, shutdown.Shutdown)
 		if err != nil {
 			return err
 		}
@@ -62,27 +56,18 @@ var shutdownCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(shutdownCmd)
-	shutdownCmd.Flags().BoolVar(&commonShutdownSettings.Verbose, "verbose", false, "be verbose")
 	shutdownCmd.Flags().BoolVar(&commonShutdownSettings.WaitForShutdown, "wait", true, "wait for shutdown to be confirmed")
 }
 
-func doShutdown(shutdownSettings *shutdownSettingsStruct) ([]byte, error) {
-	output, err := processRequestForUtility(doRequest("PUT", versionCommand("", "shutdown")))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			if strings.Contains(err.Error(), rdconfig.DefaultConfigPath) {
-				logrus.Debugf("Can't find default config file %s, assuming Rancher Desktop isn't running.\n", rdconfig.DefaultConfigPath)
-				// It's probably not running, so shutdown is a no-op
-				return nil, nil
-			}
-			return nil, err
-		}
-		urlError := new(url.Error)
-		if errors.As(err, &urlError) {
-			return []byte("Rancher Desktop is currently not running (or can't be shutdown via this command)."), nil
-		}
-		return nil, err
+func doShutdown(ctx context.Context, shutdownSettings *shutdownSettingsStruct, initiatingCommand shutdown.InitiatingCommand) ([]byte, error) {
+	var output []byte
+	connectionInfo, err := config.GetConnectionInfo(true)
+	if err == nil && connectionInfo != nil {
+		rdClient := client.NewRDClient(connectionInfo)
+		command := client.VersionCommand("", "shutdown")
+		output, _ = client.ProcessRequestForUtility(rdClient.DoRequest("PUT", command))
+		logrus.WithError(err).Trace("Shut down requested")
 	}
-	err = shutdown.FinishShutdown(shutdownSettings.WaitForShutdown)
+	err = shutdown.FinishShutdown(ctx, shutdownSettings.WaitForShutdown, initiatingCommand)
 	return output, err
 }

@@ -62,12 +62,17 @@ export default {
       type:    Boolean,
       default: false,
     },
+
+    activeTab: {
+      type:    String,
+      default: '',
+    },
   },
 
   data() {
     return {
       tabs:          [],
-      activeTabName: null,
+      activeTabName: this.activeTab,
     };
   },
 
@@ -102,6 +107,13 @@ export default {
       } else if (useHash && activeTab?.name === windowHash) {
         this.select(activeTab.name);
       }
+    },
+    activeTab(current, previous) {
+      if (current === previous || current === this.activeTabName) {
+        return;
+      }
+
+      this.select(current);
     },
   },
 
@@ -233,15 +245,30 @@ export default {
           {{ tab.labelDisplay }}
         </a>
       </li>
-      <li v-if="sideTabs && !sortedTabs.length" class="tab disabled">
+      <li
+        v-if="sideTabs && !sortedTabs.length"
+        class="tab disabled"
+      >
         <a href="#">(None)</a>
       </li>
-      <ul v-if="sideTabs && showTabsAddRemove" class="tab-list-footer">
+      <ul
+        v-if="sideTabs && showTabsAddRemove"
+        class="tab-list-footer"
+      >
         <li>
-          <button type="button" class="btn bg-transparent" @click="tabAddClicked">
+          <button
+            type="button"
+            class="btn bg-transparent"
+            @click="tabAddClicked"
+          >
             <i class="icon icon-plus icon-lg" />
           </button>
-          <button type="button" class="btn bg-transparent" :disabled="!sortedTabs.length" @click="tabRemoveClicked">
+          <button
+            type="button"
+            class="btn bg-transparent"
+            :disabled="!sortedTabs.length"
+            @click="tabRemoveClicked"
+          >
             <i class="icon icon-minus icon-lg" />
           </button>
         </li>

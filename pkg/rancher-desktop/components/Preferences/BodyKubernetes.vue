@@ -1,20 +1,30 @@
 <script lang="ts">
 
-import { Checkbox } from '@rancher/components';
+import { Banner } from '@rancher/components';
 import Vue from 'vue';
+import { mapGetters } from 'vuex';
 
-import { VersionEntry } from '@pkg/backend/k8s';
+import RdInput from '@pkg/components/RdInput.vue';
+import RdSelect from '@pkg/components/RdSelect.vue';
+import RdCheckbox from '@pkg/components/form/RdCheckbox.vue';
 import RdFieldset from '@pkg/components/form/RdFieldset.vue';
 import { Settings } from '@pkg/config/settings';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
+import { highestStableVersion, VersionEntry } from '@pkg/utils/kubeVersions';
 import { RecursiveTypes } from '@pkg/utils/typeUtils';
 
 import type { PropType } from 'vue';
 
 export default Vue.extend({
   name:       'preferences-body-kubernetes',
-  components: { Checkbox, RdFieldset },
-  props:      {
+  components: {
+    Banner,
+    RdCheckbox,
+    RdFieldset,
+    RdSelect,
+    RdInput,
+  },
+  props: {
     preferences: {
       type:     Object as PropType<Settings>,
       required: true,
@@ -22,19 +32,14 @@ export default Vue.extend({
   },
   data() {
     return {
-      enableKubernetes:   true,
-      enableTraefik:      true,
-      kubernetesPort:     6443,
       versions:           [] as VersionEntry[],
       cachedVersionsOnly: false,
-      kubernetesVersion:  this.preferences.kubernetes.version,
     };
   },
   computed: {
+    ...mapGetters('preferences', ['isPreferenceLocked']),
     defaultVersion(): VersionEntry {
-      const version = this.recommendedVersions.find(v => (v.channels ?? []).includes('stable'));
-
-      return version ?? this.recommendedVersions[0] ?? this.nonRecommendedVersions[0];
+      return highestStableVersion(this.recommendedVersions) ?? this.nonRecommendedVersions[0];
     },
     /** Versions that are the tip of a channel */
     recommendedVersions(): VersionEntry[] {
@@ -47,8 +52,16 @@ export default Vue.extend({
     isKubernetesDisabled(): boolean {
       return !this.preferences.kubernetes.enabled;
     },
+    kubernetesVersion(): string {
+      return this.preferences.kubernetes.version;
+    },
     kubernetesVersionLabel(): string {
       return `Kubernetes version${ this.cachedVersionsOnly ? ' (cached versions only)' : '' }`;
+    },
+    spinOperatorIncompatible(): boolean {
+      return !this.isKubernetesDisabled &&
+        !this.preferences.experimental.containerEngine.webAssembly.enabled &&
+        this.preferences.experimental.kubernetes.options.spinkube;
     },
   },
   beforeMount() {
@@ -68,10 +81,10 @@ export default Vue.extend({
       const names = (version.channels ?? []).filter(ch => !/^v?\d+/.test(ch));
 
       if (names.length > 0) {
-        return `v${ version.version.version } (${ names.join(', ') })`;
+        return `v${ version.version } (${ names.join(', ') })`;
       }
 
-      return `v${ version.version.version }`;
+      return `v${ version.version }`;
     },
     onChange<P extends keyof RecursiveTypes<Settings>>(property: P, value: RecursiveTypes<Settings>[P]) {
       this.$store.dispatch('preferences/updatePreferencesData', { property, value });
@@ -89,9 +102,10 @@ export default Vue.extend({
       data-test="kubernetesToggle"
       legend-text="Kubernetes"
     >
-      <checkbox
+      <rd-checkbox
         label="Enable Kubernetes"
         :value="preferences.kubernetes.enabled"
+        :is-locked="isPreferenceLocked('kubernetes.enabled')"
         @input="onChange('kubernetes.enabled', $event)"
       />
     </rd-fieldset>
@@ -100,60 +114,86 @@ export default Vue.extend({
       class="width-xs"
       :legend-text="kubernetesVersionLabel"
     >
-      <select
-        v-model="kubernetesVersion"
+      <rd-select
         class="select-k8s-version"
+        :value="kubernetesVersion"
         :disabled="isKubernetesDisabled"
+        :is-locked="isPreferenceLocked('kubernetes.version')"
         @change="onChange('kubernetes.version', $event.target.value)"
       >
         <!--
             - On macOS Chrome / Electron can't style the <option> elements.
             - We do the best we can by instead using <optgroup> for a recommended section.
             -->
-        <optgroup v-if="recommendedVersions.length > 0" label="Recommended Versions">
+        <optgroup
+          v-if="recommendedVersions.length > 0"
+          label="Recommended Versions"
+        >
           <option
             v-for="item in recommendedVersions"
-            :key="item.version.version"
-            :value="item.version.version"
-            :selected="item.version.version === defaultVersion.version.version"
+            :key="item.version"
+            :value="item.version"
+            :selected="item.version === defaultVersion.version"
           >
             {{ versionName(item) }}
           </option>
         </optgroup>
-        <optgroup v-if="nonRecommendedVersions.length > 0" label="Other Versions">
+        <optgroup
+          v-if="nonRecommendedVersions.length > 0"
+          label="Other Versions"
+        >
           <option
             v-for="item in nonRecommendedVersions"
-            :key="item.version.version"
-            :value="item.version.version"
-            :selected="item.version.version === defaultVersion.version.version"
+            :key="item.version"
+            :value="item.version"
+            :selected="item.version === defaultVersion.version"
           >
-            v{{ item.version.version }}
+            v{{ item.version }}
           </option>
         </optgroup>
-      </select>
+      </rd-select>
     </rd-fieldset>
     <rd-fieldset
       data-test="kubernetesPort"
       class="width-xs"
       legend-text="Kubernetes Port"
     >
-      <input
+      <rd-input
         type="number"
         :disabled="isKubernetesDisabled"
         :value="preferences.kubernetes.port"
+        :is-locked="isPreferenceLocked('kubernetes.port')"
         @input="onChange('kubernetes.port', castToNumber($event.target.value))"
       />
     </rd-fieldset>
     <rd-fieldset
-      data-test="traefikToggle"
-      legend-text="Traefik"
+      data-test="kubernetesOptions"
+      legend-text="Options"
     >
-      <checkbox
+      <rd-checkbox
         label="Enable Traefik"
         :disabled="isKubernetesDisabled"
         :value="preferences.kubernetes.options.traefik"
+        :is-locked="isPreferenceLocked('kubernetes.options.traefik')"
         @input="onChange('kubernetes.options.traefik', $event)"
       />
+      <!-- Don't disable Spinkube option when Wasm is disabled; let validation deal with it  -->
+      <rd-checkbox
+        label="Install Spin Operator"
+        :disabled="isKubernetesDisabled"
+        :value="preferences.experimental.kubernetes.options.spinkube"
+        :is-locked="isPreferenceLocked('experimental.kubernetes.options.spinkube')"
+        :is-experimental="true"
+        @input="onChange('experimental.kubernetes.options.spinkube', $event)"
+      >
+        <template v-if="spinOperatorIncompatible" #below>
+          <banner color="warning">
+            Spin operator requires
+            <a href="#" @click.prevent="$root.navigate('Container Engine', 'general')">WebAssembly</a>
+            to be enabled.
+          </banner>
+        </template>
+      </rd-checkbox>
     </rd-fieldset>
   </div>
 </template>

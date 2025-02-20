@@ -7,34 +7,45 @@ import path from 'path';
 
 import semver from 'semver';
 
-import { download, getResource } from '../lib/download';
+import { download, downloadTarGZ, getResource } from '../lib/download';
 
 import {
-  DownloadContext, Dependency, AlpineLimaISOVersion, getOctokit, GithubDependency, getPublishedReleaseTagNames, GithubRelease,
+  AlpineLimaISOVersion,
+  Dependency,
+  DownloadContext,
+  findChecksum,
+  getOctokit,
+  getPublishedReleaseTagNames,
+  GitHubDependency,
+  GitHubRelease,
+  rcompareVersions,
 } from 'scripts/lib/dependencies';
+import { simpleSpawn } from 'scripts/simple_process';
 
-export class LimaAndQemu implements Dependency, GithubDependency {
-  name = 'limaAndQemu';
+export class Lima implements Dependency, GitHubDependency {
+  name = 'lima';
   githubOwner = 'rancher-sandbox';
-  githubRepo = 'lima-and-qemu';
+  githubRepo = 'rancher-desktop-lima';
 
   async download(context: DownloadContext): Promise<void> {
     const baseUrl = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download`;
     let platform: string = context.platform;
 
     if (platform === 'darwin') {
-      platform = 'macos';
-      if (process.env.M1) {
-        platform = `macos-aarch64`;
-      }
+      platform = `macos-15.${ process.env.M1 ? 'arm64' : 'amd64' }`;
+    } else {
+      platform = 'linux.amd64';
     }
-    const url = `${ baseUrl }/v${ context.versions.limaAndQemu }/lima-and-qemu.${ platform }.tar.gz`;
+
+    const url = `${ baseUrl }/v${ context.versions.lima }/lima.${ platform }.tar.gz`;
     const expectedChecksum = (await getResource(`${ url }.sha512sum`)).split(/\s+/)[0];
     const limaDir = path.join(context.resourcesDir, context.platform, 'lima');
-    const tarPath = path.join(context.resourcesDir, context.platform, `lima-v${ context.versions.limaAndQemu }.tgz`);
+    const tarPath = path.join(context.resourcesDir, context.platform, `lima.${ platform }.v${ context.versions.lima }.tgz`);
 
     await download(url, tarPath, {
-      expectedChecksum, checksumAlgorithm: 'sha512', access: fs.constants.W_OK,
+      expectedChecksum,
+      checksumAlgorithm: 'sha512',
+      access:            fs.constants.W_OK,
     });
     await fs.promises.mkdir(limaDir, { recursive: true });
 
@@ -63,6 +74,74 @@ export class LimaAndQemu implements Dependency, GithubDependency {
   }
 
   rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
+    return rcompareVersions(version1, version2);
+  }
+}
+
+export class Qemu implements Dependency, GitHubDependency {
+  name = 'qemu';
+  githubOwner = 'rancher-sandbox';
+  githubRepo = 'rancher-desktop-qemu';
+
+  async download(context: DownloadContext): Promise<void> {
+    const baseUrl = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download`;
+    const arch = context.isM1 ? 'aarch64' : 'x86_64';
+
+    const url = `${ baseUrl }/v${ context.versions.qemu }/qemu-${ context.versions.qemu }-${ context.platform }-${ arch }.tar.gz`;
+    const expectedChecksum = (await getResource(`${ url }.sha512sum`)).split(/\s+/)[0];
+    const limaDir = path.join(context.resourcesDir, context.platform, 'lima');
+    const tarPath = path.join(context.resourcesDir, context.platform, `qemu.v${ context.versions.qemu }.tgz`);
+
+    await download(url, tarPath, {
+      expectedChecksum, checksumAlgorithm: 'sha512', access: fs.constants.W_OK,
+    });
+    await fs.promises.mkdir(limaDir, { recursive: true });
+
+    await simpleSpawn('/usr/bin/tar', ['-xf', tarPath], { cwd: limaDir });
+  }
+
+  async getAvailableVersions(): Promise<string[]> {
+    const tagNames = await getPublishedReleaseTagNames(this.githubOwner, this.githubRepo);
+
+    return tagNames.map((tagName: string) => tagName.replace(/^v/, ''));
+  }
+
+  versionToTagName(version: string): string {
+    return `v${ version }`;
+  }
+
+  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
+    return rcompareVersions(version1, version2);
+  }
+}
+
+export class SocketVMNet implements Dependency, GitHubDependency {
+  name = 'socketVMNet';
+  githubOwner = 'lima-vm';
+  githubRepo = 'socket_vmnet';
+
+  async download(context: DownloadContext): Promise<void> {
+    const arch = context.isM1 ? 'arm64' : 'x86_64';
+    const baseURL = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ context.versions.socketVMNet }`;
+    const archiveName = `socket_vmnet-${ context.versions.socketVMNet }-${ arch }.tar.gz`;
+    const expectedChecksum = await findChecksum(`${ baseURL }/SHA256SUMS`, archiveName);
+
+    await downloadTarGZ(`${ baseURL }/${ archiveName }`,
+      path.join(context.resourcesDir, context.platform, 'lima', 'socket_vmnet', 'bin', 'socket_vmnet'),
+      { expectedChecksum, entryName: './opt/socket_vmnet/bin/socket_vmnet' });
+  }
+
+  async getAvailableVersions(): Promise<string[]> {
+    const tagNames = await getPublishedReleaseTagNames(this.githubOwner, this.githubRepo);
+
+    return tagNames.map((tagName: string) => tagName.replace(/^v/, ''));
+  }
+
+  versionToTagName(version: string): string {
+    return `v${ version }`;
+  }
+
+  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
     const semver1 = semver.coerce(version1);
     const semver2 = semver.coerce(version2);
 
@@ -74,11 +153,10 @@ export class LimaAndQemu implements Dependency, GithubDependency {
   }
 }
 
-export class AlpineLimaISO implements Dependency, GithubDependency {
+export class AlpineLimaISO implements Dependency, GitHubDependency {
   name = 'alpineLimaISO';
   githubOwner = 'rancher-sandbox';
   githubRepo = 'alpine-lima';
-  isoVersionRegex = /^[0-9]+\.[0-9]+\.[0-9]+\.rd[0-9]+$/;
 
   async download(context: DownloadContext): Promise<void> {
     const baseUrl = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download`;
@@ -99,8 +177,8 @@ export class AlpineLimaISO implements Dependency, GithubDependency {
     });
   }
 
-  assembleAlpineLimaISOVersionFromGithubRelease(release: GithubRelease): AlpineLimaISOVersion {
-    const matchingAsset = release.assets.find(asset => asset.name.includes('rd'));
+  assembleAlpineLimaISOVersionFromGitHubRelease(release: GitHubRelease): AlpineLimaISOVersion {
+    const matchingAsset = release.assets.find((asset: { name: string }) => asset.name.includes('rd'));
 
     if (!matchingAsset) {
       throw new Error(`Could not find matching asset name in set ${ release.assets }`);
@@ -121,32 +199,15 @@ export class AlpineLimaISO implements Dependency, GithubDependency {
   async getAvailableVersions(): Promise<AlpineLimaISOVersion[]> {
     const response = await getOctokit().rest.repos.listReleases({ owner: this.githubOwner, repo: this.githubRepo });
     const releases = response.data;
-    const versions = await Promise.all(releases.map(this.assembleAlpineLimaISOVersionFromGithubRelease));
 
-    return versions;
+    return await Promise.all(releases.map(this.assembleAlpineLimaISOVersionFromGitHubRelease));
   }
 
   versionToTagName(version: AlpineLimaISOVersion): string {
     return `v${ version.isoVersion }`;
   }
 
-  versionToSemver(version: AlpineLimaISOVersion): string {
-    const isoVersion = version.isoVersion;
-    const isoVersionParts = isoVersion.split('.');
-
-    if (!this.isoVersionRegex.test(isoVersion)) {
-      throw new Error(`${ this.name }: version ${ version } is not in expected format ${ this.isoVersionRegex }`);
-    }
-    const normalVersion = isoVersionParts.slice(0, 3).join('.');
-    const prereleaseVersion = isoVersionParts[3].replace('rd', '');
-
-    return `${ normalVersion }-${ prereleaseVersion }`;
-  }
-
   rcompareVersions(version1: AlpineLimaISOVersion, version2: AlpineLimaISOVersion): -1 | 0 | 1 {
-    const semverVersion1 = this.versionToSemver(version1);
-    const semverVersion2 = this.versionToSemver(version2);
-
-    return semver.rcompare(semverVersion1, semverVersion2);
+    return rcompareVersions(version1.isoVersion, version2.isoVersion);
   }
 }
