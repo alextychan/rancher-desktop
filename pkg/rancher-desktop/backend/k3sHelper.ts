@@ -7,7 +7,9 @@ import stream from 'stream';
 import tls from 'tls';
 import util from 'util';
 
-import { CustomObjectsApi, KubeConfig, V1ObjectMeta, findHomeDir } from '@kubernetes/client-node';
+import {
+  CustomObjectsApi, KubeConfig, V1ObjectMeta, findHomeDir, HttpError,
+} from '@kubernetes/client-node';
 import { ActionOnInvalid } from '@kubernetes/client-node/dist/config_types';
 import _ from 'lodash';
 import { Response } from 'node-fetch';
@@ -16,14 +18,15 @@ import yaml from 'yaml';
 
 import { Architecture, VMExecutor } from './backend';
 
-import { KubeClient } from '@pkg/backend/client';
 import * as K8s from '@pkg/backend/k8s';
+import { KubeClient } from '@pkg/backend/kube/client';
 import { loadFromString, exportConfig } from '@pkg/backend/kubeconfig';
-import { checkConnectivity } from '@pkg/main/networking';
+import mainEvents from '@pkg/main/mainEvents';
 import { isUnixError } from '@pkg/typings/unix.interface';
 import DownloadProgressListener from '@pkg/utils/DownloadProgressListener';
 import * as childProcess from '@pkg/utils/childProcess';
 import fetch from '@pkg/utils/fetch';
+import { SemanticVersionEntry } from '@pkg/utils/kubeVersions';
 import Latch from '@pkg/utils/latch';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
@@ -38,16 +41,20 @@ import type Electron from 'electron';
 const console = Logging.k8s;
 
 /**
- * ShortVersion is the version string without any k3s suffixes; this is the
- * version we present to the user.
+ * ShortVersion is the version string without any k3s suffixes, nor a "v"
+ * prefix; this is the version we present to the user.
  */
 export type ShortVersion = string;
 
-export interface ReleaseAPIEntry {
+let isOnline = true;
 
+mainEvents.on('update-network-status', (connected) => {
+  isOnline = connected;
+});
+
+export interface ReleaseAPIEntry {
   tag_name: string;
   assets: {
-
     browser_download_url: string;
     name: string;
   }[];
@@ -64,7 +71,7 @@ type cacheData = {
   /** List of available versions; includes build information. */
   versions: string[];
   /** Mapping of channel labels to current version (excluding build information). */
-  channels: Record<string, string>;
+  channels: Record<string, ShortVersion>;
 };
 
 /**
@@ -112,31 +119,6 @@ export class ChannelMapping {
 }
 
 /**
- * VersionEntry implements K8s.VersionEntry.
- *
- * This only exists to aid in debugging (by implementing util.debug.custom).
- * This is only exported for tests.
- */
-export class VersionEntry implements K8s.VersionEntry {
-  version: semver.SemVer;
-  channels?: string[];
-
-  constructor(version: semver.SemVer, channels: string[] = []) {
-    this.version = version;
-    if (channels?.length > 0) {
-      this.channels = channels;
-    }
-  }
-
-  [util.inspect.custom](depth: number, options: util.InspectOptionsStylized) {
-    return util.inspect({
-      ...this,
-      version: this.version.raw,
-    }, { ...options, depth });
-  }
-}
-
-/**
  * Given a version, return the K3s build version.
  *
  * Note that this is only exported for testing.
@@ -154,8 +136,14 @@ export default class K3sHelper extends events.EventEmitter {
   protected readonly channelApiAccept = 'application/json';
   protected readonly releaseApiUrl = 'https://api.github.com/repos/k3s-io/k3s/releases?per_page=100';
   protected readonly releaseApiAccept = 'application/vnd.github.v3+json';
+  protected readonly resourcesPath = path.join(paths.resources, 'k3s-versions.json');
   protected readonly cachePath = path.join(paths.cache, 'k3s-versions.json');
-  protected readonly minimumVersion = new semver.SemVer('1.15.0');
+  protected readonly minimumVersion = new semver.SemVer('1.21.0');
+  /**
+   * versionFromChannel is a mapping from the channel name to the latest (short)
+   * version in that channel.
+   */
+  protected versionFromChannel: Record<string, ShortVersion> = {};
 
   constructor(arch: Architecture) {
     super();
@@ -167,7 +155,7 @@ export default class K3sHelper extends events.EventEmitter {
    * without any build information (since we only ever take the latest build).
    * Note that the key is in the form `1.0.0` (i.e. without the `v` prefix).
    */
-  protected versions: Record<ShortVersion, VersionEntry> = {};
+  protected versions: Record<ShortVersion, SemanticVersionEntry> = {};
 
   protected pendingNetworkSetup = Latch();
   protected pendingInitialize: Promise<void> | undefined;
@@ -181,8 +169,17 @@ export default class K3sHelper extends events.EventEmitter {
    */
   protected async readCache() {
     try {
-      const cacheData: cacheData =
-        JSON.parse(await fs.promises.readFile(this.cachePath, 'utf-8'));
+      let cacheData: cacheData;
+
+      try {
+        cacheData = JSON.parse(await fs.promises.readFile(this.cachePath, 'utf-8'));
+        if (cacheData.cacheVersion !== CURRENT_CACHE_VERSION) {
+          throw new Error(`Invalid cache version ${ cacheData.cacheVersion }`);
+        }
+      } catch (ex) {
+        console.debug('Failed to read cached k3s versions; falling back to bundled versions list:', ex);
+        cacheData = JSON.parse(await fs.promises.readFile(this.resourcesPath, 'utf-8'));
+      }
 
       if (cacheData.cacheVersion !== CURRENT_CACHE_VERSION) {
         // If the cache format version is different, ignore the cache.
@@ -194,8 +191,8 @@ export default class K3sHelper extends events.EventEmitter {
       for (const versionString of cacheData.versions) {
         const version = semver.parse(versionString);
 
-        if (version) {
-          this.versions[version.version] = new VersionEntry(version);
+        if (version && semver.gte(version, this.minimumVersion)) {
+          this.versions[version.version] = new SemanticVersionEntry(version);
         }
       }
 
@@ -206,6 +203,7 @@ export default class K3sHelper extends events.EventEmitter {
         }
         this.versions[version].channels ??= [];
         this.versions[version].channels?.push(channel);
+        this.versionFromChannel[channel] = version;
       }
 
       for (const entry of Object.values(this.versions)) {
@@ -285,7 +283,7 @@ export default class K3sHelper extends events.EventEmitter {
 
       return true;
     }
-    if (version < this.minimumVersion) {
+    if (version.compare(this.minimumVersion) < 0) {
       console.log(`Version ${ version } is less than the minimum ${ this.minimumVersion }, skipping.`);
 
       // We may have new patch versions for really old releases; fetch more.
@@ -327,7 +325,7 @@ export default class K3sHelper extends events.EventEmitter {
       const foundImage = this.filenames.images.find(name => entry.assets.some(v => v.name === name));
 
       if (foundImage) {
-        this.versions[version.version] = new VersionEntry(version);
+        this.versions[version.version] = new SemanticVersionEntry(version);
         console.log(`Adding version ${ version.raw } - ${ foundImage }`);
       } else {
         console.debug(`Skipping version ${ version.raw } due to missing image`);
@@ -370,6 +368,10 @@ export default class K3sHelper extends events.EventEmitter {
     return a.localeCompare(b);
   }
 
+  /**
+   * Fetch the list of available Kubernetes versions.
+   * @throws If there were issues fetching the list of versions.
+   */
   protected async updateCache(): Promise<void> {
     try {
       let wantMoreVersions = true;
@@ -382,10 +384,11 @@ export default class K3sHelper extends events.EventEmitter {
       let channelResponse: Response;
 
       try {
-        channelResponse = await fetch(this.channelApiUrl, { headers: { Accept: this.channelApiAccept } });
+        channelResponse = await fetch(this.channelApiUrl,
+          { headers: { Accept: this.channelApiAccept } });
       } catch (ex: any) {
         console.log(`updateCache: error: ${ ex }`);
-        if (!(await checkConnectivity('k3s.io'))) {
+        if (!isOnline) {
           return;
         }
 
@@ -393,14 +396,30 @@ export default class K3sHelper extends events.EventEmitter {
       }
 
       if (channelResponse.ok) {
-        const channels = (await channelResponse.json()) as { data?: { name: string, latest: string }[] };
+        const ValidResourceTypes = ['channel', 'channels'];
+        const DataTypeChannel = 'channel';
 
-        // Remove any existing channels (to ensure channels we no longer use are removed)
-        for (const version of Object.values(channelMapping)) {
-          this.versions[version.version]?.channels?.splice(0, Number.POSITIVE_INFINITY);
-        }
+        type ChannelResponse = {
+          resourceType: string;
+          data?: {
+            type: typeof DataTypeChannel;
+            name: string;
+            latest: string;
+          }[];
+        };
+        const channels: ChannelResponse = await channelResponse.json();
+
         console.debug(`Got K3s update channel data: ${ channels.data?.map(ch => ch.name) }`);
+        if (!ValidResourceTypes.includes(channels.resourceType)) {
+          throw new Error(`Channel response does not have correct resource type: ${ channels.resourceType }`);
+        }
+
         for (const channel of channels.data ?? []) {
+          if (channel.type !== DataTypeChannel) {
+            // The channel entry is invalid; ignore it.
+            continue;
+          }
+
           const version = semver.parse(channel.latest);
 
           if (version) {
@@ -411,7 +430,12 @@ export default class K3sHelper extends events.EventEmitter {
       }
 
       while (wantMoreVersions && url) {
-        const response = await fetch(url, { headers: { Accept: this.releaseApiAccept } });
+        const headers: HeadersInit = { Accept: this.releaseApiAccept };
+
+        if (process.env.GITHUB_TOKEN) {
+          headers.Authorization = `Bearer ${ process.env.GITHUB_TOKEN }`;
+        }
+        const response = await fetch(url, { headers });
 
         console.debug(`Fetching releases from ${ url } -> ${ response.statusText }`);
         if (!response.ok) {
@@ -447,6 +471,16 @@ export default class K3sHelper extends events.EventEmitter {
         const entry = this.versions[version.version];
 
         if (entry) {
+          if (this.versionFromChannel[channel] && this.versionFromChannel[channel] !== version.version) {
+            const otherEntry = this.versions[this.versionFromChannel[channel]];
+
+            if (otherEntry?.channels) {
+              otherEntry.channels = otherEntry.channels.filter(ch => ch !== channel);
+              if (otherEntry.channels.length === 0) {
+                delete otherEntry.channels;
+              }
+            }
+          }
           entry.channels ??= [];
           if (!entry.channels.includes(channel)) {
             entry.channels.push(channel);
@@ -457,7 +491,6 @@ export default class K3sHelper extends events.EventEmitter {
 
       console.log(`Got ${ Object.keys(this.versions).length } versions.`);
       await this.writeCache();
-
       this.emit('versions-updated');
     } catch (e) {
       console.error(e);
@@ -493,13 +526,21 @@ export default class K3sHelper extends events.EventEmitter {
         await this.readCache();
         if (Object.keys(this.versions).length > 0) {
           // Start a cache update asynchronously without waiting for it
-          this.updateCache();
+          this.updateCache().catch((ex: any) => {
+            console.log(`updateCache failed: ${ ex }`);
+          });
 
           return;
         }
-        await this.updateCache();
+        try {
+          await this.updateCache();
+        } catch (ex) {
+          console.log(`Ignoring failure to get initial versions list: ${ ex }`);
+          // At this point this.versions is still empty.
+        }
       })();
     }
+    this.versionFromChannel = {};
 
     return this.pendingInitialize;
   }
@@ -541,23 +582,24 @@ export default class K3sHelper extends events.EventEmitter {
 
   /**
    * The versions that are available to install.
+   * @note The list will be empty if the machine is offline and we have no
+   * cached versions.
    */
-  get availableVersions(): Promise<K8s.VersionEntry[]> {
+  get availableVersions(): Promise<SemanticVersionEntry[]> {
     return (async() => {
       await this.initialize();
-      const upstreamSeemsReachable = await checkConnectivity('k3s.io');
       const wrappedVersions = Object.values(this.versions);
-      const finalOptions = upstreamSeemsReachable ? wrappedVersions : await K3sHelper.filterVersionsAgainstCache(wrappedVersions);
+      const finalOptions = isOnline ? wrappedVersions : await K3sHelper.filterVersionsAgainstCache(wrappedVersions);
 
       return finalOptions.sort((a, b) => b.version.compare(a.version));
     })();
   }
 
-  static async cachedVersionsOnly(): Promise<boolean> {
-    return !(await checkConnectivity('k3s.io'));
+  static cachedVersionsOnly(): Promise<boolean> {
+    return Promise.resolve(!isOnline);
   }
 
-  static async filterVersionsAgainstCache(fullVersionList: K8s.VersionEntry[]): Promise<K8s.VersionEntry[]> {
+  static async filterVersionsAgainstCache(fullVersionList: SemanticVersionEntry[]): Promise<SemanticVersionEntry[]> {
     try {
       const cacheDir = path.join(paths.cache, 'k3s');
       const k3sFilenames = (await fs.promises.readdir(cacheDir))
@@ -609,8 +651,8 @@ export default class K3sHelper extends events.EventEmitter {
    * that is considered closest to the desired version:
    *
    * @precondition the desired version wasn't found
-   * @param desiredVersion: a semver for the version currently specified in the config
-   * @param k3sNames: typically a list of names like 'v1.2.3+k3s4'
+   * @param desiredVersion a semver for the version currently specified in the config
+   * @param k3sNames typically a list of names like 'v1.2.3+k3s4'
    * @returns {semver.SemVer} the oldest version newer than the desired version
    *      If there is more than one such version, favor the one with the highest '+k3s' build version
    *      If there are none, the newest version older than the desired version
@@ -825,7 +867,7 @@ export default class K3sHelper extends events.EventEmitter {
               // includes the host we're looking for; when the server starts, it
               // may be using an obsolete certificate from a previous run that
               // doesn't include the current IP address.
-              const names = cert.subjectaltname.split(',').map(s => s.trim());
+              const names = cert.subjectaltname?.split(',')?.map(s => s.trim()) ?? [];
               const acceptable = [`IP Address:${ host }`, `DNS:${ host }`];
 
               if (!names.some(name => acceptable.includes(name))) {
@@ -974,7 +1016,7 @@ export default class K3sHelper extends events.EventEmitter {
       merge(userConfig.contexts, workConfig.contexts);
       merge(userConfig.users, workConfig.users);
       merge(userConfig.clusters, workConfig.clusters);
-      userConfig.currentContext ??= contextName;
+      userConfig.currentContext ||= contextName;
       // Use custom exportConfig() that supports the `proxy-url` cluster field.
       const userYAML = this.ensureContentsAreYAML(exportConfig(userConfig));
       const writeStream = fs.createWriteStream(workPath, { mode: 0o600 });
@@ -1030,28 +1072,45 @@ export default class K3sHelper extends events.EventEmitter {
    * Manually uninstall the K3s-installed copy of Traefik, if it exists.
    * This exists to work around https://github.com/k3s-io/k3s/issues/5103
    */
-  async uninstallTraefik(client: KubeClient) {
-    try {
-      const customApi = client.k8sClient.makeApiClient(CustomObjectsApi);
-      const { body: response } = await customApi.listNamespacedCustomObject('helm.cattle.io', 'v1', 'kube-system', 'helmcharts');
-      const charts: V1HelmChart[] = (response as any)?.items ?? [];
+  async uninstallHelmChart(client: KubeClient, ownerName: string) {
+    const deadline = Date.now() + 10 * 60 * 1_000;
 
-      await Promise.all(charts.filter((chart) => {
-        const annotations = chart.metadata?.annotations ?? {};
+    // If the Kubernetes server is not ready yet, we need to retry until it is.
+    // However, don't attempt that forever; only loop until we hit a deadline.
+    while (Date.now() < deadline) {
+      try {
+        const customApi = client.k8sClient.makeApiClient(CustomObjectsApi);
+        const { body: response } = await customApi.listNamespacedCustomObject('helm.cattle.io', 'v1', 'kube-system', 'helmcharts');
+        const charts: V1HelmChart[] = (response as any)?.items ?? [];
 
-        return chart.metadata?.name && (annotations['objectset.rio.cattle.io/owner-name'] === 'traefik');
-      }).map((chart) => {
-        const name = chart.metadata?.name;
+        await Promise.all(charts.filter((chart) => {
+          const annotations = chart.metadata?.annotations ?? {};
 
-        if (name) {
-          console.debug(`Will delete helm chart ${ name }`);
+          return chart.metadata?.name && (annotations['objectset.rio.cattle.io/owner-name'] === ownerName);
+        }).map((chart) => {
+          const name = chart.metadata?.name;
 
-          return customApi.deleteNamespacedCustomObject('helm.cattle.io', 'v1', 'kube-system', 'helmcharts', name);
+          if (name) {
+            console.debug(`Will delete helm chart ${ name }`);
+
+            return customApi.deleteNamespacedCustomObject('helm.cattle.io', 'v1', 'kube-system', 'helmcharts', name);
+          }
+        }));
+
+        return;
+      } catch (ex) {
+        if (ex instanceof HttpError && ex.statusCode === 503) {
+          console.debug(`Got Service Unavailable (${ ex.body.message }), retrying...`);
+          await util.promisify(setTimeout)(1_000);
+          continue;
         }
-      }));
-    } catch (ex) {
-      console.error('Error uninstalling Traefik', ex);
+        console.error(`Error uninstalling ${ ownerName }`, ex);
+
+        return;
+      }
     }
+
+    console.error('Timed out uninstalling Traefik, giving up');
   }
 
   /**
@@ -1107,29 +1166,6 @@ export default class K3sHelper extends events.EventEmitter {
   }
 
   /**
-   * Check if the given Kubernetes version requires the port forwarding fix
-   * (where we listen on a local port).
-   *
-   * @param version Kubernetes version; null if no Kubernetes will run.
-   */
-  static requiresPortForwardingFix(version: semver.SemVer | undefined): boolean {
-    if (!version) {
-      // When Kubernetes is disabled, don't try to do NodePort forwarding.
-      return false;
-    }
-    switch (true) {
-    case version.major !== 1: return true;
-    case version.minor < 21: return false;
-    case version.minor === 21: return version.patch >= 12;
-    case version.minor === 22: return version.patch >= 10;
-    case version.minor === 23: return version.patch >= 7;
-    case version.minor >= 24: return true;
-    default:
-      throw new Error(`Unexpected Kubernetes version ${ version }`);
-    }
-  }
-
-  /**
    * Helper for implementing KubernetesBackend.requiresRestartReasons
    */
   requiresRestartReasons(
@@ -1147,8 +1183,8 @@ export default class K3sHelper extends events.EventEmitter {
      * @param key The identifier to use for the UI.
      */
     function cmp<K extends keyof K8s.RestartReasons>(key: K, checker?: RequiresRestartSeverityChecker<K>) {
-      const current = _.get(currentSettings, key, NotFound);
-      const desired = _.get(desiredSettings, key, NotFound);
+      const current: RecursiveTypes<K8s.BackendSettings>[K] | typeof NotFound = _.get(currentSettings, key, NotFound) as any;
+      const desired: RecursiveTypes<K8s.BackendSettings>[K] | typeof NotFound = _.get(desiredSettings, key, NotFound) as any;
 
       if (current === NotFound) {
         throw new Error(`Invalid restart check: path ${ path } not found on current values`);

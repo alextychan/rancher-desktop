@@ -1,13 +1,12 @@
 /**
  * This module describes the various paths we use to store state & data.
  */
-
+import { spawnSync } from 'child_process';
+import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
 import electron from 'electron';
-
-const APP_NAME = 'rancher-desktop';
 
 export interface Paths {
   /** appHome: the location of the main appdata directory. */
@@ -20,122 +19,143 @@ export interface Paths {
   logs: string;
   /** Directory which holds caches that may be removed. */
   cache: string;
+  /** Directory that holds resource files in the RD installation. */
+  resources: string;
+  /** Directory holding Lima state (Unix-specific). */
+  lima: string;
+  /** Directory holding provided binary resources */
+  integration: string;
+  /** Deployment Profile System-wide startup settings path. */
+  deploymentProfileSystem: string;
+  /** Deployment Profile User startup settings path. */
+  deploymentProfileUser: string;
+  /** Directory that will hold extension data. */
+  readonly extensionRoot: string;
   /** Directory holding the WSL distribution (Windows-specific). */
   wslDistro: string;
   /** Directory holding the WSL data distribution (Windows-specific). */
   wslDistroData: string;
-  /** Directory holding Lima state (macOS-specific). */
-  lima: string;
-  /** Directory holding provided binary resources */
-  integration: string;
-  /** The directory that used to hold provided binary integrations */
-  oldIntegration: string;
-  /** Directory that holds resource files in the RD installation. */
-  resources: string;
+  /** Directory that holds snapshots. */
+  snapshots: string;
+  /** Directory that holds user-managed containerd-shims. */
+  containerdShims: string;
 }
 
-/**
- * Provides the `resources` key for any class that extends it.
- */
-class ProvidesResources {
-  get resources(): string {
-    const basePath = electron.app.isPackaged ? process.resourcesPath : electron.app.getAppPath();
+export class UnixPaths implements Paths {
+  appHome = '';
+  altAppHome = '';
+  config = '';
+  logs = '';
+  cache = '';
+  resources = '';
+  lima = '';
+  integration = '';
+  deploymentProfileSystem = '';
+  deploymentProfileUser = '';
+  extensionRoot = '';
+  snapshots = '';
+  containerdShims = '';
 
-    return path.join(basePath, 'resources');
+  constructor(pathsData: Record<string, unknown>) {
+    Object.assign(this, pathsData);
   }
-}
-
-/**
- * DarwinPaths implements paths for Darwin / macOS.
- */
-export class DarwinPaths extends ProvidesResources implements Paths {
-  appHome = path.join(os.homedir(), 'Library', 'Application Support', APP_NAME);
-  altAppHome = path.join(os.homedir(), '.rd');
-  config = path.join(os.homedir(), 'Library', 'Preferences', APP_NAME);
-  logs = process.env.RD_LOGS_DIR ?? path.join(os.homedir(), 'Library', 'Logs', APP_NAME);
-  cache = path.join(os.homedir(), 'Library', 'Caches', APP_NAME);
-  lima = path.join(this.appHome, 'lima');
-  oldIntegration = '/usr/local/bin';
-  integration = path.join(this.altAppHome, 'bin');
 
   get wslDistro(): string {
-    throw new Error('wslDistro not available for darwin');
+    throw new Error('wslDistro not available for Unix');
   }
 
   get wslDistroData(): string {
-    throw new Error('wslDistro not available for darwin');
+    throw new Error('wslDistroData not available for Unix');
   }
 }
 
-/**
- * Win32Paths implements paths for Windows.
- * Note that this should be kept in sync with .../pkg/rancher-desktop/go/wsl-helper/pkg/reset.
- */
-export class Win32Paths extends ProvidesResources implements Paths {
-  protected readonly appData = process.env['APPDATA'] || path.join(os.homedir(), 'AppData', 'Roaming');
-  protected readonly localAppData = process.env['LOCALAPPDATA'] || path.join(os.homedir(), 'AppData', 'Local');
-  readonly appHome = path.join(this.appData, APP_NAME);
-  readonly altAppHome = this.appHome;
-  readonly config = path.join(this.appData, APP_NAME);
-  readonly logs = process.env.RD_LOGS_DIR ?? path.join(this.localAppData, APP_NAME, 'logs');
-  readonly cache = path.join(this.localAppData, APP_NAME, 'cache');
-  readonly wslDistro = path.join(this.localAppData, APP_NAME, 'distro');
-  readonly wslDistroData = path.join(this.localAppData, APP_NAME, 'distro-data');
+export class WindowsPaths implements Paths {
+  appHome = '';
+  altAppHome = '';
+  config = '';
+  logs = '';
+  cache = '';
+  resources = '';
+  extensionRoot = '';
+  wslDistro = '';
+  wslDistroData = '';
+  snapshots = '';
+  containerdShims = '';
+
+  constructor(pathsData: Record<string, unknown>) {
+    Object.assign(this, pathsData);
+  }
 
   get lima(): string {
     throw new Error('lima not available for Windows');
   }
 
-  get oldIntegration(): string {
-    throw new Error('Internal error: oldIntegration path not available for Windows');
-  }
-
   get integration(): string {
     throw new Error('Internal error: integration path not available for Windows');
   }
-}
 
-/**
- * LinuxPaths implements paths for Linux.
- */
-export class LinuxPaths extends ProvidesResources implements Paths {
-  protected readonly dataHome = process.env['XDG_DATA_HOME'] || path.join(os.homedir(), '.local', 'share');
-  protected readonly configHome = process.env['XDG_CONFIG_HOME'] || path.join(os.homedir(), '.config');
-  protected readonly cacheHome = process.env['XDG_CACHE_HOME'] || path.join(os.homedir(), '.cache');
-  readonly appHome = path.join(this.configHome, APP_NAME);
-  readonly altAppHome = path.join(os.homedir(), '.rd');
-  readonly config = path.join(this.configHome, APP_NAME);
-  readonly logs = process.env.RD_LOGS_DIR ?? path.join(this.dataHome, APP_NAME, 'logs');
-  readonly cache = path.join(this.cacheHome, APP_NAME);
-  readonly lima = path.join(this.dataHome, APP_NAME, 'lima');
-  readonly integration = path.join(this.altAppHome, 'bin');
-  readonly oldIntegration = path.join(os.homedir(), '.local', 'bin');
-
-  get wslDistro(): string {
-    throw new Error('wslDistro not available for Linux');
+  get deploymentProfileSystem(): string {
+    throw new Error('Internal error: Windows profiles will be read from Registry');
   }
 
-  get wslDistroData(): string {
-    throw new Error('wslDistro not available for Linux');
+  get deploymentProfileUser(): string {
+    throw new Error('Internal error: Windows profiles will be read from Registry');
   }
 }
 
-const UnsupportedPaths: Paths = new Proxy({} as Paths, {
-  get(target, prop) {
-    throw new Error(`Paths ${ String(prop) } not available for ${ os.platform() }`);
-  },
-});
+// Gets the path to rdctl. Returns null if rdctl cannot be found.
+export function getRdctlPath(): string | null {
+  let basePath: string;
+
+  // If we are running as a script (i.e. yarn postinstall), electron.app is undefined
+  if (electron.app?.isPackaged) {
+    basePath = process.resourcesPath;
+  } else {
+    basePath = process.cwd();
+  }
+  const osSpecificName = os.platform().startsWith('win') ? `rdctl.exe` : 'rdctl';
+  const rdctlPath = path.join(basePath, 'resources', os.platform(), 'bin', osSpecificName);
+
+  if (!fs.existsSync(rdctlPath)) {
+    return null;
+  }
+
+  return rdctlPath;
+}
 
 function getPaths(): Paths {
-  switch (os.platform()) {
+  const rdctlPath = getRdctlPath();
+  let pathsData: Partial<Paths>|undefined;
+  let errorMsg = '';
+
+  if (rdctlPath) {
+    const result = spawnSync(rdctlPath, ['paths'], { encoding: 'utf8' });
+
+    if (result.status === 0 && result.stdout.length > 0) {
+      pathsData = JSON.parse(result.stdout);
+    } else {
+      errorMsg = `rdctl paths failed: ${ JSON.stringify(result) }`;
+    }
+  }
+  if (!pathsData) {
+    const processType = process.type;
+
+    errorMsg ||= `Internal error: attempting to load the paths module from a ${ processType } process. (rdctl: ${ rdctlPath })`;
+    if (processType === 'renderer') {
+      alert(errorMsg);
+    }
+    throw new Error(errorMsg);
+  }
+
+  switch (process.platform) {
   case 'darwin':
-    return new DarwinPaths();
-  case 'win32':
-    return new Win32Paths();
+    return new UnixPaths(pathsData);
   case 'linux':
-    return new LinuxPaths();
+    return new UnixPaths(pathsData);
+  case 'win32':
+    return new WindowsPaths(pathsData);
   default:
-    return UnsupportedPaths;
+    throw new Error(`Platform "${ process.platform }" is not supported.`);
   }
 }
 

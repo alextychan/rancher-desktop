@@ -1,9 +1,14 @@
 # Default Lima configuration; parts will be overridden in code.
 
+# Rancher Desktop ships with a patched QEMU that supports the Apple M4 CPU
+# So override Lima 1.0.3 falling back to cortex-a72.
+cpuType:
+  aarch64: host
+
 ssh:
   loadDotSSHPubKeys: false
 firmware:
-  legacyBIOS: true
+  legacyBIOS: false
 containerd:
   system: false
   user: false
@@ -38,12 +43,32 @@ provision:
     fi
     umount /bootfs
     rmdir /bootfs
+- # make sure we booted with the right cgroup mode; k3s versions before 1.20.4 only support cgroup v1
+  mode: system
+  script: |
+    #!/bin/sh
+    set -o errexit -o nounset -o xtrace
+    RC_CGROUP_MODE=unified
+    if ! grep -q -E "^#?rc_cgroup_mode=\"$RC_CGROUP_MODE\"" /etc/rc.conf; then
+      sed -i -E "s/^#?rc_cgroup_mode=\".*\"/rc_cgroup_mode=\"$RC_CGROUP_MODE\"/" /etc/rc.conf
+      # avoid reboot loop if sed failed for any reason
+      if grep -q -E "^rc_cgroup_mode=\"$RC_CGROUP_MODE\"" /etc/rc.conf; then
+        reboot
+      fi
+    fi
 - # return unused space from the data volume back to the host
   mode: system
   script: |
     #!/bin/sh
     set -o errexit -o nounset -o xtrace
     fstrim /mnt/data
+- # allow more than 10 sessions over the master control path
+  mode: system
+  script: |
+    #!/bin/sh
+    set -o errexit -o nounset -o xtrace
+    sed -i -E 's/^#?MaxSessions +[0-9]+/MaxSessions 25/g' /etc/ssh/sshd_config
+    rc-service --ifstarted sshd reload
 - # Persist /root directory on data volume
   mode: system
   script: |
@@ -68,10 +93,10 @@ provision:
     # Create symlink if certs.d doesn't exist (user may have created a regular directory).
     if [ ! -e /etc/docker/certs.d ]; then
       # We don't know if the host is Linux or macOS, so we take a guess based on which mountpoint exists.
-      if [ -d "/Users/${LIMA_CIDATA_USER}" ]; then
-        ln -s "/Users/${LIMA_CIDATA_USER}/.docker/certs.d" /etc/docker
-      elif [ -d "/home/${LIMA_CIDATA_USER}" ]; then
-        ln -s "/home/${LIMA_CIDATA_USER}/.docker/certs.d" /etc/docker
+      if [ -d "/Users/{{.User}}" ]; then
+        ln -s "/Users/{{.User}}/.docker/certs.d" /etc/docker
+      elif [ -d "/home/{{.User}}" ]; then
+        ln -s "/home/{{.User}}/.docker/certs.d" /etc/docker
       fi
     fi
 - # Make sure hostname doesn't change during upgrade from earlier versions
@@ -110,7 +135,7 @@ provision:
   mode: system
   script: |
     set -o errexit -o nounset -o xtrace
-    usermod --append --groups docker "${LIMA_CIDATA_USER}"
+    usermod --append --groups docker "{{.User}}"
 - # Install mkcert and prepare default/fallback cert for localhost
   mode: system
   script: |
@@ -126,14 +151,17 @@ provision:
     set -o errexit -o nounset -o xtrace
 
     # openresty is backgrounding itself (and writes its own pid file)
-    sed -i 's/^command_background/#command_background/' /etc/init.d/openresty
+    sed -i 's/^command_background/#command_background/' /etc/init.d/rd-openresty
 
-    # configure proxy only when image-allow-list exists
-    ial=/usr/local/openresty/nginx/conf/image-allow-list.conf
-    setproxy="[ -f $ial ] && supervise_daemon_args=\"-e HTTPS_PROXY=http://127.0.0.1:3128 \$supervise_daemon_args\""
+    # configure proxy only when allowed-images exists
+    allowed_images_conf=/usr/local/openresty/nginx/conf/allowed-images.conf
+    # Remove the reference to an obsolete image conf filename
+    obsolete_image_allow_list_conf=/usr/local/openresty/nginx/conf/image-allow-list.conf
+    setproxy="[ -f $allowed_images_conf ] && supervise_daemon_args=\"-e HTTPS_PROXY=http://127.0.0.1:3128 \${supervise_daemon_args:-}\" || true"
     for svc in containerd docker; do
-      sed -i "\#-f $ial#d" /etc/init.d/$svc
-      sed -i "/^supervise_daemon_args/a $setproxy" /etc/init.d/$svc
+      sed -i "\#-f $allowed_images_conf#d" /etc/init.d/$svc
+      sed -i "\#-f $obsolete_image_allow_list_conf#d" /etc/init.d/$svc
+      echo "$setproxy" >> /etc/init.d/$svc
     done
 
     # Make sure openresty log directory exists
@@ -148,6 +176,11 @@ provision:
     mount bpffs -t bpf /sys/fs/bpf
     mount --make-shared /sys/fs/bpf
     mount --make-shared /sys/fs/cgroup
+- # we run trivy as root now; remove any cached databases installed into the user directory by previous version
+  # trivy.db is 600M and trivy-java.db is 1.1G
+  mode: user
+  script: |
+    rm -rf "${HOME}/.cache/trivy"
 portForwards:
 - guestPortRange: [1, 65535]
   guestIPMustBeZero: true

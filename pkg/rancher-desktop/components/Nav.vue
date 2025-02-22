@@ -1,8 +1,15 @@
 <template>
   <nav>
     <ul>
-      <li v-for="item in items" :key="item.route" :item="item.route">
-        <NuxtLink :to="item.route">
+      <li
+        v-for="item in items"
+        :key="item.route"
+        :item="item.route"
+      >
+        <NuxtLink
+          :class="{'nuxt-link-active': isRouteActive(item.route) }"
+          :to="item.route"
+        >
           {{ routes[item.route].name }}
           <badge-state
             v-if="item.error"
@@ -10,9 +17,46 @@
             class="nav-badge"
             :label="item.error.toString()"
           />
+          <i
+            v-if="item.experimental"
+            v-tooltip="{
+              content: t('prefs.experimental'),
+              placement: 'right',
+            }"
+            :class="`icon icon-flask`"
+          />
         </NuxtLink>
       </li>
     </ul>
+    <hr v-if="extensionsWithUI.length">
+    <div class="nav-extensions">
+      <template v-for="extension in extensionsWithUI">
+        <nuxt-link
+          :key="extension.id"
+          :data-test="`extension-nav-${ extension.metadata.ui['dashboard-tab'].title.toLowerCase() }`"
+          :to="extensionRoute(extension)"
+        >
+          <nav-item :id="`extension:${extension.id}`">
+            <template #before>
+              <nav-icon-extension :extension-id="extension.id" />
+            </template>
+            {{ extension.metadata.ui['dashboard-tab'].title }}
+          </nav-item>
+        </nuxt-link>
+      </template>
+    </div>
+    <div class="nav-button-container">
+      <dashboard-button
+        data-testid="dashboard-button"
+        class="nav-button"
+        @open-dashboard="openDashboard"
+      />
+      <preferences-button
+        data-testid="preferences-button"
+        class="nav-button"
+        @open-preferences="openPreferences"
+      />
+    </div>
   </nav>
 </template>
 
@@ -21,11 +65,30 @@ import os from 'os';
 
 import { NuxtApp } from '@nuxt/types/app';
 import { BadgeState } from '@rancher/components';
+import Vue, { PropType } from 'vue';
 import { RouteRecordPublic } from 'vue-router';
 
-export default {
-  components: { BadgeState },
-  props:      {
+import NavIconExtension from './NavIconExtension.vue';
+import NavItem from './NavItem.vue';
+
+import DashboardButton from '@pkg/components/DashboardOpen.vue';
+import PreferencesButton from '@pkg/components/Preferences/ButtonOpen.vue';
+import type { ExtensionMetadata } from '@pkg/main/extensions/types';
+import { hexEncode } from '@pkg/utils/string-encode';
+
+type ExtensionWithUI = ExtensionMetadata & {
+  ui: { 'dashboard-tab': { title: string } };
+};
+
+export default Vue.extend({
+  components: {
+    BadgeState,
+    NavItem,
+    NavIconExtension,
+    DashboardButton,
+    PreferencesButton,
+  },
+  props: {
     items: {
       type:      Array,
       required:  true,
@@ -48,6 +111,10 @@ export default {
         });
       },
     },
+    extensions: {
+      type:     Array as PropType<{ id: string, metadata: ExtensionMetadata }[]>,
+      required: true,
+    },
   },
   data() {
     const nuxt: NuxtApp = (this as any).$nuxt;
@@ -65,17 +132,66 @@ export default {
       }, {}),
     };
   },
-};
+  computed: {
+    extensionsWithUI(): { id: string, metadata: ExtensionWithUI }[] {
+      const allExtensions: { id: string, metadata: ExtensionMetadata }[] = (this as any).extensions;
+
+      return allExtensions.filter(ext => ext.metadata?.ui?.['dashboard-tab']) as any;
+    },
+  },
+  methods: {
+    extensionRoute({ id, metadata }: { id: string, metadata: any }) {
+      const { ui: { 'dashboard-tab': { root, src } } } = metadata;
+
+      return {
+        name:   'rdx-root-src-id',
+        params: {
+          root,
+          src,
+          id: hexEncode(id),
+        },
+      };
+    },
+    isRouteActive(route: string): boolean {
+      // It is needed e.g. for sub-route /images/add not matching /Images
+      const nuxt: NuxtApp = (this as any).$nuxt;
+
+      // Prevents the parent item "Extensions" to be shown as active if an extension child (e.g. Epinio, Logs Explorer,
+      // ...) is selected.
+      if (nuxt.$route.name !== 'rdx-root-src-id') {
+        return nuxt.$route.path.split('/')[1] === route.substring(1).toLowerCase();
+      }
+
+      return false;
+    },
+    openPreferences(): void {
+      this.$emit('open-preferences');
+    },
+    openDashboard(): void {
+      this.$emit('open-dashboard');
+    },
+  },
+});
 </script>
 
 <!-- Add "scoped" attribute to limit CSS to this component only -->
 <style scoped lang="scss">
-
 nav {
     background-color: var(--nav-bg);
     padding: 0;
     margin: 0;
-    padding-top: 20px;
+    padding: 20px 0;
+    display: flex;
+    flex-direction: column;
+
+    a {
+      text-decoration: none;
+    }
+
+    .nav-extensions {
+      overflow: auto;
+      flex-grow: 1
+    }
 }
 
 ul {
@@ -87,12 +203,14 @@ ul {
         padding: 0;
 
         a {
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
             color: var(--body-text);
             text-decoration: none;
             line-height: 24px;
             padding: 7.5px 10px;
             letter-spacing: 1.4px;
-            display: block;
             outline: none;
         }
 
@@ -102,10 +220,32 @@ ul {
     }
 }
 
+a {
+  &:hover {
+    text-decoration: none;
+  }
+
+  &.nuxt-link-active::v-deep div {
+    background-color: var(--nav-active);
+  }
+}
+
 .nav-badge {
   line-height: initial;
   letter-spacing: initial;
   font-size: 0.75rem;
+}
+
+.nav-button-container {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+
+  .nav-button {
+    flex: 1;
+    margin: 5px 10px 0px 10px;
+    justify-content: center;
+  }
 }
 
 </style>

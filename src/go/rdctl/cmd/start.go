@@ -18,15 +18,13 @@ package cmd
 
 import (
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
-	"path"
 	"runtime"
-	"strconv"
 	"strings"
 
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/directories"
+	options "github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/options/generated"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/paths"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -47,11 +45,13 @@ If it's running, behaves the same as 'rdctl set ...'.
 }
 
 var applicationPath string
+var noModalDialogs bool
 
 func init() {
 	rootCmd.AddCommand(startCmd)
-	updateCommonStartAndSetCommands(startCmd)
-	startCmd.Flags().StringVarP(&applicationPath, "path", "p", "", "Path to main executable.")
+	options.UpdateCommonStartAndSetCommands(startCmd)
+	startCmd.Flags().StringVarP(&applicationPath, "path", "p", "", "path to main executable")
+	startCmd.Flags().BoolVarP(&noModalDialogs, "no-modal-dialogs", "", false, "avoid displaying dialog boxes")
 }
 
 /**
@@ -66,52 +66,27 @@ func doStartOrSetCommand(cmd *cobra.Command) error {
 		// try to upload the settings (if any were specified).
 		if applicationPath != "" {
 			// `--path | -p` is not a valid option for `rdctl set...`
-			return fmt.Errorf("--path %s specified but Rancher Desktop is already running", applicationPath)
+			return fmt.Errorf("--path %q specified but Rancher Desktop is already running", applicationPath)
 		}
-		err = doSetCommand(cmd)
-		if err == nil || cmd.Name() == "set" {
-			return err
-		}
+		return doSetCommand(cmd)
 	}
-	// If `set...` failed, try running the original `start` command, if only to give
-	// an error message from the point of view of `start` rather than `set`.
 	cmd.SilenceUsage = true
 	return doStartCommand(cmd)
 }
 
 func doStartCommand(cmd *cobra.Command) error {
-	var commandLineArgs []string
-
-	if cmd.Flags().Changed("container-engine") {
-		commandLineArgs = append(commandLineArgs, "--kubernetes-containerEngine", specifiedSettings.ContainerEngine)
+	commandLineArgs, err := options.GetCommandLineArgsForStartCommand(cmd.Flags())
+	if err != nil {
+		return err
 	}
-	if cmd.Flags().Changed("kubernetes-enabled") {
-		commandLineArgs = append(commandLineArgs, "--kubernetes-enabled="+strconv.FormatBool(specifiedSettings.Enabled))
-	}
-	if cmd.Flags().Changed("kubernetes-version") {
-		commandLineArgs = append(commandLineArgs, "--kubernetes-version", specifiedSettings.Version)
-	}
-	if cmd.Flags().Changed("flannel-enabled") {
-		commandLineArgs = append(commandLineArgs, "--kubernetes-options-flannel"+strconv.FormatBool(specifiedSettings.Flannel))
-	}
-	if applicationPath == "" {
-		pathLookupFuncs := map[string]func(rdctlPath string) string{
-			"windows": getWindowsRDPath,
-			"linux":   getLinuxRDPath,
-			"darwin":  getMacOSRDPath,
-		}
-		getPathFunc, ok := pathLookupFuncs[runtime.GOOS]
-		if !ok {
-			return fmt.Errorf("don't know how to find the path to Rancher Desktop on OS %s", runtime.GOOS)
-		}
-		rdctlPath, err := os.Executable()
+	if !cmd.Flags().Changed("path") {
+		applicationPath, err = paths.GetRDLaunchPath(cmd.Context())
 		if err != nil {
-			rdctlPath = ""
+			return fmt.Errorf("failed to locate main Rancher Desktop executable: %w\nplease retry with the --path option", err)
 		}
-		applicationPath = getPathFunc(rdctlPath)
-		if applicationPath == "" {
-			return fmt.Errorf("could not locate main Rancher Desktop executable; please retry with the --path option")
-		}
+	}
+	if noModalDialogs {
+		commandLineArgs = append(commandLineArgs, "--no-modal-dialogs")
 	}
 	return launchApp(applicationPath, commandLineArgs)
 }
@@ -138,93 +113,4 @@ func launchApp(applicationPath string, commandLineArgs []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Start()
-}
-
-func moveToParent(fullPath string, numberTimes int) string {
-	fullPath = path.Clean(fullPath)
-	for ; numberTimes > 0; numberTimes-- {
-		fullPath = path.Dir(fullPath)
-	}
-	return fullPath
-}
-
-func getWindowsRDPath(rdctlPath string) string {
-	if rdctlPath != "" {
-		normalParentPath := moveToParent(rdctlPath, 5)
-		candidatePath := checkExistence(path.Join(normalParentPath, "Rancher Desktop.exe"), 0)
-		if candidatePath != "" {
-			return candidatePath
-		}
-	}
-	homedir, err := os.UserHomeDir()
-	if err != nil {
-		homedir = ""
-	}
-	dataPaths := []string{}
-	// %LOCALAPPDATA%
-	dir, err := directories.GetLocalAppDataDirectory()
-	if err == nil {
-		dataPaths = append(dataPaths, dir)
-	}
-	// %APPDATA%
-	dir, err = directories.GetRoamingAppDataDirectory()
-	if err == nil {
-		dataPaths = append(dataPaths, dir)
-	}
-	// Add these two paths if the above two fail to find where the program was installed
-	dataPaths = append(
-		dataPaths,
-		path.Join(homedir, "AppData", "Local"),
-		path.Join(homedir, "AppData", "Roaming"),
-	)
-	for _, dataDir := range dataPaths {
-		candidatePath := checkExistence(path.Join(dataDir, "Programs", "Rancher Desktop", "Rancher Desktop.exe"), 0)
-		if candidatePath != "" {
-			return candidatePath
-		}
-	}
-	return ""
-}
-
-func getMacOSRDPath(rdctlPath string) string {
-	if rdctlPath != "" {
-		// we're at .../Applications/R D.app (could have a different name)/Contents/Resources/resources/darwin/bin
-		// and want to move to the "R D.app" part
-		RDAppParentPath := moveToParent(rdctlPath, 6)
-		if checkExistence(path.Join(RDAppParentPath, "Contents", "MacOS", "Rancher Desktop"), 0o111) != "" {
-			return RDAppParentPath
-		}
-	}
-	// This fallback is mostly for running `npm run dev` and using the installed app because there is no app
-	// that rdctl would launch directly in dev mode.
-	return checkExistence(path.Join("/Applications", "Rancher Desktop.app"), 0)
-}
-
-func getLinuxRDPath(rdctlPath string) string {
-	if rdctlPath != "" {
-		normalParentPath := moveToParent(rdctlPath, 5)
-		candidatePath := checkExistence(path.Join(normalParentPath, "rancher-desktop"), 0o111)
-		if candidatePath != "" {
-			return candidatePath
-		}
-	}
-	return checkExistence("/opt/rancher-desktop/rancher-desktop", 0o111)
-}
-
-/**
- * Verify the path exists. For Linux pass in mode bits to guarantee the file is executable (for at least one
- * category of user). Note that on macOS the candidate is a directory, so never pass in mode bits.
- * And mode bits don't make sense on Windows.
- */
-func checkExistence(candidatePath string, modeBits fs.FileMode) string {
-	stat, err := os.Stat(candidatePath)
-	if err != nil {
-		return ""
-	}
-	if modeBits != 0 && (!stat.Mode().IsRegular() || stat.Mode().Perm()&modeBits == 0) {
-		// The modeBits check is only for executability -- we only care if at least one of the three
-		// `x` mode bits is on. So this check isn't used for a general permission-mode-bit check.
-		return ""
-	}
-	return candidatePath
 }

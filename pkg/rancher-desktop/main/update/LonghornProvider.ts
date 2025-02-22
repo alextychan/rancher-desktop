@@ -12,13 +12,15 @@ import semver from 'semver';
 
 import fetch from '@pkg/utils/fetch';
 import Logging from '@pkg/utils/logging';
+import { getMacOsVersion } from '@pkg/utils/osVersion';
 import paths from '@pkg/utils/paths';
+import getWSLVersion from '@pkg/utils/wslVersion';
 
 const console = Logging.update;
 const gCachePath = path.join(paths.cache, 'updater-longhorn.json');
 
 /**
- * If the upgrade responder doesn't have a requestIntervalInMinutes field (or if
+ * If Upgrade Responder doesn't have a requestIntervalInMinutes field (or if
  * it's zero), use this value instead.  Note that the server can still set it to
  * be less than this value.
  */
@@ -29,7 +31,7 @@ const defaultUpdateIntervalInMinutes = 60;
  */
 export interface LonghornProviderOptions extends CustomPublishOptions {
   /**
-   * upgradeServer is the URL for the upgrade-responder server
+   * upgradeServer is the URL for the Upgrade Responder server
    * @example "https://responder.example.com:8314/v1/checkupgrade"
    */
   readonly upgradeServer: string;
@@ -58,25 +60,48 @@ export interface LonghornUpdateInfo extends UpdateInfo {
    * an update.
    */
   nextUpdateTime: number;
+  /**
+   * Whether there is an unsupported version of Rancher Desktop that is
+   * newer than the latest supported version.
+   */
+  unsupportedUpdateAvailable: boolean;
 }
 
 /**
- * LonghornUpgraderResponse describes the response from the Longhorn upgrade
- * responder service.
+ * LonghornUpgraderResponse describes the response from the Longhorn Upgrade
+ * Responder service.
  */
 interface LonghornUpgraderResponse {
-  versions: {
-    Name: string;
-    ReleaseDate: Date;
-    Tags: string[];
-  }[];
+  versions: UpgradeResponderVersion[];
   /**
-   * The number of minutes before the next upgrade check should be performed.
+   * The number of minutes before the next update check should be performed.
    */
   requestIntervalInMinutes: number;
 }
 
-export interface GithubReleaseAsset {
+type UpgradeResponderVersion = {
+    Name: string;
+    ReleaseDate: Date;
+    Supported?: boolean;
+    Tags: string[];
+};
+
+type UpgradeResponderQueryResult = {
+  latest: UpgradeResponderVersion;
+  requestIntervalInMinutes: number,
+  unsupportedUpdateAvailable: boolean,
+};
+
+export type UpgradeResponderRequestPayload = {
+  appVersion: string;
+  extraInfo: {
+    platform: string;
+    platformVersion: string;
+    wslVersion?: string,
+  },
+};
+
+export interface GitHubReleaseAsset {
   url: string;
 
   browser_download_url: string;
@@ -87,10 +112,10 @@ export interface GithubReleaseAsset {
 }
 
 /**
- * GithubReleaseInfo describes the API response from GitHub for fetching one
+ * GitHubReleaseInfo describes the API response from GitHub for fetching one
  * release.
  */
-interface GithubReleaseInfo {
+interface GitHubReleaseInfo {
   url: string;
   id: number;
 
@@ -101,7 +126,7 @@ interface GithubReleaseInfo {
   prerelease: boolean;
 
   published_at: string;
-  assets: GithubReleaseAsset[];
+  assets: GitHubReleaseAsset[];
 }
 
 /**
@@ -112,6 +137,11 @@ interface GithubReleaseInfo {
 interface LonghornCache {
   /** The minimum time (in Unix epoch) we should next check for an update. */
   nextUpdateTime: number;
+  /**
+   * Whether there is an unsupported version of Rancher Desktop that is
+   * newer than the latest supported version.
+   */
+  unsupportedUpdateAvailable: boolean;
   /** Whether the recorded release is an installable update */
   isInstallable: boolean;
   release: {
@@ -187,11 +217,118 @@ export async function setHasQueuedUpdate(isQueued: boolean): Promise<void> {
 }
 
 /**
+ * Return the OS version of whatever platform we are running on.
+ * Note that this is *not* the kernel version; it is the OS version,
+ * i.e. the version of the entire package, including kernel,
+ * userspace programs, base configuration, etc.
+ */
+function getPlatformVersion(): string {
+  switch (process.platform) {
+  case 'win32':
+    return os.release();
+  case 'darwin': {
+    return getMacOsVersion().toString();
+  }
+  case 'linux':
+    // OS version is hard to get on Linux and could be in many different
+    // formats. We hard-code it to 0.0.0 so that Upgrade Responder can
+    // parse it into an InstanceInfo. Nevertheless, automatic updates
+    // are not supported on Linux as of the time of writing, so this is
+    // just in case we want to introduce rules for Linux that don't have
+    // to do with platform version in the future.
+    return '0.0.0';
+  }
+  throw new Error(`Platform "${ process.platform }" is not supported`);
+}
+
+/**
+ * Get the installed WSL version as a string.  If the inbox version of WSL is
+ * installed (rather than the store version), we just hard code "1.0.0" instead.
+ * @note This function should never throw;
+ */
+export async function getWslVersionString(): Promise<string | undefined> {
+  try {
+    const { installed, inbox, version } = await getWSLVersion();
+
+    if (!installed) {
+      return;
+    }
+    if (inbox) {
+      return '1.0.0';
+    }
+
+    return `${ version.major }.${ version.minor }.${ version.revision }.${ version.build }`;
+  } catch (ex) {
+    console.error('Failed to get WSL version:', ex);
+  }
+}
+
+/**
+ * Fetch info on available versions of Rancher Desktop, as well as other
+ * things, from the Upgrade Responder server.
+ */
+export async function queryUpgradeResponder(url: string, currentVersion: semver.SemVer): Promise<UpgradeResponderQueryResult> {
+  const requestPayload: UpgradeResponderRequestPayload = {
+    appVersion: currentVersion.toString(),
+    extraInfo:  {
+      platform:        `${ process.platform }-${ os.arch() }`,
+      platformVersion: getPlatformVersion(),
+    },
+  };
+
+  if (process.platform === 'win32') {
+    const wslVersion = await getWslVersionString();
+
+    if (wslVersion) {
+      requestPayload.extraInfo.wslVersion = wslVersion;
+    }
+  }
+
+  // If we are using anything on `github.io` as the update server, we're
+  // trying to run a simplified test.  In that case, break the protocol and do
+  // a HTTP GET instead of the HTTP POST with data we should do for actual
+  // Longhorn Upgrade Responder servers.
+  const requestOptions = /^https?:\/\/[^/]+\.github\.io\//.test(url) ? { method: 'GET' } : {
+    method: 'POST',
+    body:   JSON.stringify(requestPayload),
+  };
+
+  console.debug(`Checking ${ url } for updates`);
+  const responseRaw = await fetch(url, requestOptions);
+  const response = await responseRaw.json() as LonghornUpgraderResponse;
+
+  console.debug(`Upgrade Responder response:`, util.inspect(response, true, null));
+
+  const allVersions = response.versions;
+
+  // If Upgrade Responder does not send the Supported field,
+  // assume that the version is supported.
+  for (const version of allVersions) {
+    version.Supported ??= true;
+  }
+
+  allVersions.sort((version1, version2) => semver.rcompare(version1.Name, version2.Name));
+  const supportedVersions = allVersions.filter(version => version.Supported);
+
+  if (supportedVersions.length === 0) {
+    throw newError('Could not find latest version', 'ERR_UPDATER_LATEST_VERSION_NOT_FOUND');
+  }
+  const latest = supportedVersions[0];
+  const unsupportedUpdateAvailable = allVersions[0].Name !== latest.Name;
+
+  return {
+    latest,
+    requestIntervalInMinutes: response.requestIntervalInMinutes,
+    unsupportedUpdateAvailable,
+  };
+}
+
+/**
  * LonghornProvider is a Provider that interacts with Longhorn's
  * [Upgrade Responder](https://github.com/longhorn/upgrade-responder) server to
- * locate upgrade versions.  It assumes that the versions are actually published
- * as GitHub releases.  It also assumes that all versions have assets for all
- * platforms (that is, it doesn't filter by platform on checking).
+ * determine which versions are available. It assumes that the versions are
+ * published as GitHub releases. It also assumes that all versions have assets
+ * for all platforms (that is, it doesn't filter by platform on checking).
  *
  * Note that we do internal caching to avoid issues with being double-counted in
  * the stats.
@@ -240,33 +377,11 @@ export default class LonghornProvider extends Provider<LonghornUpdateInfo> {
       }
     }
 
-    // Get the latest release from the upgrade responder.
-    const requestPayload = {
-      appVersion: this.updater.currentVersion.format(),
-      extraInfo:  { platform: `${ os.platform() }-${ os.arch() }` },
-    };
-    // If we are using anything on `github.io` as the update server, we're
-    // trying to run a simplified test.  In that case, break the protocol and do
-    // a HTTP GET instead of the HTTP POST with data we should do for actual
-    // longhorn upgrade-responder servers.
-    const requestOptions = /^https?:\/\/[^/]+\.github\.io\//.test(this.configuration.upgradeServer) ? { method: 'GET' } : {
-      method: 'POST',
-      body:   JSON.stringify(requestPayload),
-    };
-
-    console.debug(`Checking for upgrades from ${ this.configuration.upgradeServer }`);
-    const responseRaw = await fetch(this.configuration.upgradeServer, requestOptions);
-    const response = await responseRaw.json() as LonghornUpgraderResponse;
-
-    console.debug(`Upgrade server response:`, util.inspect(response, true, null));
-    const latest = response.versions?.find(v => v.Tags.includes('latest'));
-    const requestIntervalInMinutes = response.requestIntervalInMinutes || defaultUpdateIntervalInMinutes;
+    const queryResult = await queryUpgradeResponder(this.configuration.upgradeServer, this.updater.currentVersion);
+    const { latest, unsupportedUpdateAvailable } = queryResult;
+    const requestIntervalInMinutes = queryResult.requestIntervalInMinutes || defaultUpdateIntervalInMinutes;
     const requestIntervalInMs = requestIntervalInMinutes * 1000 * 60;
     const nextRequestTime = Date.now() + requestIntervalInMs;
-
-    if (!latest) {
-      throw newError('Could not find latest version', 'ERR_UPDATER_LATEST_VERSION_NOT_FOUND');
-    }
 
     // Get release information from GitHub releases.
     const { owner, repo, vPrefixedTagName } = this.configuration;
@@ -274,19 +389,19 @@ export default class LonghornProvider extends Provider<LonghornUpdateInfo> {
     const infoURL = `https://api.github.com/repos/${ owner }/${ repo }/releases/tags/${ tag }`;
     const releaseInfoRaw = await fetch(infoURL,
       { headers: { Accept: 'application/vnd.github.v3+json' } });
-    const releaseInfo = await releaseInfoRaw.json() as GithubReleaseInfo;
-    const assetFilter: (asset: GithubReleaseAsset) => boolean = (() => {
+    const releaseInfo = await releaseInfoRaw.json() as GitHubReleaseInfo;
+    const assetFilter: (asset: GitHubReleaseAsset) => boolean = (() => {
       switch (this.platform) {
       case 'darwin': {
-        const isArm64 = Electron.app.runningUnderARM64Translation || os.arch() === 'arm64';
+        const isArm64 = process.arch === 'arm64';
         const suffix = isArm64 ? '-mac.aarch64.zip' : '-mac.x86_64.zip';
 
-        return (asset: GithubReleaseAsset) => asset.name.endsWith(suffix);
+        return (asset: GitHubReleaseAsset) => asset.name.endsWith(suffix);
       }
       case 'linux':
-        return (asset: GithubReleaseAsset) => asset.name.endsWith('AppImage');
+        return (asset: GitHubReleaseAsset) => asset.name.endsWith('AppImage');
       case 'win32': {
-        return (asset: GithubReleaseAsset) => asset.name.endsWith('.msi');
+        return (asset: GitHubReleaseAsset) => asset.name.endsWith('.msi');
       }
       }
     })();
@@ -312,6 +427,7 @@ export default class LonghornProvider extends Provider<LonghornUpdateInfo> {
 
     const cache: LonghornCache = {
       nextUpdateTime: nextRequestTime,
+      unsupportedUpdateAvailable,
       isInstallable:  false, // Always false, we'll update this later.
       release:        {
         tag,
@@ -342,13 +458,14 @@ export default class LonghornProvider extends Provider<LonghornUpdateInfo> {
         sha512:                cache.file.checksum,
         isAdminRightsRequired: false,
       }],
-      version:        cache.release.tag,
-      path:           '',
-      sha512:         '',
-      releaseName:    cache.release.name,
-      releaseNotes:   cache.release.notes,
-      releaseDate:    cache.release.date,
-      nextUpdateTime: cache.nextUpdateTime,
+      version:                    cache.release.tag,
+      path:                       '',
+      sha512:                     '',
+      releaseName:                cache.release.name,
+      releaseNotes:               cache.release.notes,
+      releaseDate:                cache.release.date,
+      nextUpdateTime:             cache.nextUpdateTime,
+      unsupportedUpdateAvailable: cache.unsupportedUpdateAvailable,
     };
   }
 
