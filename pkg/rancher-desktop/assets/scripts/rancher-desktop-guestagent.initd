@@ -2,7 +2,6 @@
 # shellcheck shell=ksh
 
 depend() {
-  after vtunnel-peer
   after network-online
 }
 
@@ -12,16 +11,16 @@ supervisor=supervise-daemon
 name="Rancher Desktop Guest Agent"
 command=/usr/local/bin/rancher-desktop-guestagent
 command_args="
+  ${GUESTAGENT_ADMIN_INSTALL:+-adminInstall=${GUESTAGENT_ADMIN_INSTALL}}
   ${GUESTAGENT_KUBERNETES:+-kubernetes=${GUESTAGENT_KUBERNETES}}
-  ${GUESTAGENT_IPTABLES:+-iptables=${GUESTAGENT_IPTABLES}}
-  ${GUESTAGENT_PRIVILEGED_SERVICE:+-privilegedService=${GUESTAGENT_PRIVILEGED_SERVICE}}
   ${GUESTAGENT_DOCKER:+-docker=${GUESTAGENT_DOCKER}}
   ${GUESTAGENT_CONTAINERD:+-containerd=${GUESTAGENT_CONTAINERD}}
+  ${GUESTAGENT_K8S_SVC_ADDR:+-k8sServiceListenerAddr=${GUESTAGENT_K8S_SVC_ADDR}}
   ${GUESTAGENT_DEBUG:+-debug}
   "
 command_args="${command_args//$'\n'/ }"
-output_log="${GUESTAGENT_LOGFILE}"
-error_log="${GUESTAGENT_LOGFILE}"
+output_log="'${GUESTAGENT_LOGFILE}'"
+error_log="'${GUESTAGENT_LOGFILE}'"
 
 respawn_delay=5
 respawn_max=0

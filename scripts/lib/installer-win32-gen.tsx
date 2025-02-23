@@ -1,4 +1,4 @@
-
+/* eslint-disable @typescript-eslint/ban-ts-comment */
 /** @jsx Element.new */
 
 import crypto from 'crypto';
@@ -70,15 +70,9 @@ export class Element {
 const Component = 'Component';
 const ComponentGroup = 'ComponentGroup';
 const ComponentGroupRef = 'ComponentGroupRef';
-const Condition = 'Condition';
 const Directory = 'Directory';
 const File = 'File';
 const Fragment = 'Fragment';
-const PermissionEx = 'PermissionEx';
-const RegistryKey = 'RegistryKey';
-const RegistryValue = 'RegistryValue';
-const ServiceControl = 'ServiceControl';
-const ServiceInstall = 'ServiceInstall';
 const Shortcut = 'Shortcut';
 const ShortcutProperty = 'ShortcutProperty';
 
@@ -92,7 +86,7 @@ type directory = {
   name: string;
   /** Child directories. */
   directories: directory[];
-  /** The regular files within this direcotry */
+  /** The regular files within this directory */
   files: { name: string, id: string }[];
 };
 
@@ -164,6 +158,7 @@ export default async function generateFileList(rootPath: string): Promise<string
   const descendantDirs = getDescendantDirs(rootDir).filter(d => d.files.length > 0);
 
   const specialComponents: Record<string, (d: directory, f: { name: string, id: string }) => Element | null> = {
+    // @ts-ignore
     'Rancher Desktop.exe': (d, f) => {
       return <Component>
         <File
@@ -199,82 +194,14 @@ export default async function generateFileList(rootPath: string): Promise<string
       return null;
     },
 
-    'wix-install-wsl.ps1': (d, f) => {
-      return <Component>
-        <Condition>NOT WSLKERNELINSTALLED</Condition>
-        <File
-          Name={f.name}
-          Source="build\\wix-install-wsl.ps1"
-          ReadOnly="yes"
-          KeyPath="yes"
-          Id={f.id}
-        />
-      </Component>;
-    },
-
-    'resources\\resources\\win32\\internal\\privileged-service.exe': (d, f) => {
-      return <Component>
-        <Condition>{'MSIINSTALLPERUSER <> 1'}</Condition>
-        <File
-          Name={f.name}
-          Source={path.join('$(var.appDir)', d.name, f.name)}
-          ReadOnly="yes"
-          KeyPath="yes"
-          Id={f.id}
-        />
-        <ServiceInstall
-          DisplayName="Rancher Desktop Privileged Service"
-          ErrorControl="ignore"
-          Name="RancherDesktopPrivilegedService"
-          Start="demand"
-          Type="ownProcess"
-        >
-          {/* SDDL explanation
-            * O:SY  // Owner: SDDL_LOCAL_SYSTEM
-            * D:()  // DACL (see ACE strings)
-            * A;    // ACE type: SDDL_ACCESS_ALLOWED
-            * ;     // ACE flags: none
-            * GRGX; // Rights: GENERIC_READ + GENERIC_EXECUTE
-            * ;     // Object GUID: none
-            * ;     // Inherit Object GUID: none
-            * IU    // Account SID: SDDL_INTERACTIVE
-            *       // Resource attribute: none
-            * And for the second ACE, needed for uninstall:
-            * A;    // ACE type: SDDL_ACCESS_ALLOWED
-            * ;     // ACE flags: none
-            * GA;   // Rights: GENERIC_ALL
-            * ;     // Object GUID: none
-            * ;     // Inherit Object GUID: none
-            * SY    // Accound SID: LOCAL_SYSTEM
-            *       // Resource attribute: none
-            */}
-          <PermissionEx Sddl="O:SYD:(A;;GRGX;;;IU)(A;;GA;;;SY)" />
-        </ServiceInstall>
-        {/* See https://learn.microsoft.com/en-us/windows/win32/msi/deleteservices-action
-          * We always run StopServices/DeleteServices/InstallFiles&c/InstallServices
-          * in that order; so it makes sense to have Remove="both".
-          */}
-        <ServiceControl
-          Id="RancherDesktopPrivilegedServiceControl"
-          Name="RancherDesktopPrivilegedService"
-          Stop="both"
-          Remove="both"
-          Wait="yes"
-        />
-        <RegistryKey
-          Root="HKLM"
-          Key="SYSTEM\CurrentControlSet\Services\EventLog\Application\RancherDesktopPrivilegedService"
-        >
-          <RegistryValue Name="EventMessageFile" Type="expandable" Value="%SYSTEMROOT%\System32\EventCreate.exe" />
-          <RegistryValue Name="TypesSupported" Type="integer" Value="7" />{/* Error, warning, info */}
-        </RegistryKey>
-      </Component>;
+    'wix-custom-action.dll': () => {
+      // This file does not need to be installed; it's used as an unnamed
+      // binary instead; see main.wxs.
+      return null;
     },
   };
 
-  rootDir.files.push({ name: 'wix-install-wsl.ps1', id: 'f_install_wsl' });
-
-  return (<Fragment>
+  const jsxElement = (<Fragment>
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="ProgramFiles64Folder">
         <Directory Id="APPLICATIONFOLDER" Name="Rancher Desktop">
@@ -334,5 +261,8 @@ export default async function generateFileList(rootPath: string): Promise<string
       })}
     </ComponentGroup>,
     )}
-  </Fragment>).toXML();
+  </Fragment>);
+
+  // @ts-ignore
+  return jsxElement.toXML();
 }

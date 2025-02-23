@@ -1,5 +1,4 @@
-// eslint-disable-next-line import/no-named-as-default
-import IntlMessageFormat from 'intl-messageformat';
+import { IntlMessageFormat } from 'intl-messageformat';
 
 import en from '@pkg/assets/translations/en-us.yaml';
 import { LOCALE } from '@pkg/config/cookies';

@@ -1,10 +1,14 @@
 import path from 'path';
-import { URL } from 'url';
+import { URL, pathToFileURL } from 'url';
 
-import { app, ProtocolRequest, ProtocolResponse, protocol } from 'electron';
+import { app, protocol, net } from 'electron';
 
-import { isDevEnv } from '@pkg/utils/environment';
+import { isDevBuild } from '@pkg/utils/environment';
 import Latch from '@pkg/utils/latch';
+import Logging from '@pkg/utils/logging';
+import paths from '@pkg/utils/paths';
+
+const console = Logging['protocol-handler'];
 
 /**
  * Create a URL that consists of a base combined with the provided path
@@ -13,54 +17,22 @@ import Latch from '@pkg/utils/latch';
  * and provided path
  */
 function redirectedUrl(relPath: string) {
-  if (isDevEnv) {
+  if (isDevBuild) {
     return `http://localhost:8888${ relPath }`;
   }
-
-  return path.join(app.getAppPath(), 'dist', 'app', relPath);
-}
-
-/**
- * Constructs an appropriate protocol response based on the environment
- * (dev, prod, etc...). Used for the registered protocol.
- * @param request The original Electron ProtocolRequest
- * @param redirectUrl The fully-qualified redirect URL
- * @param relPath The relative path to the requested resource
- * @returns A properly structured result for the registered protocol
- */
-function getProtocolResponse(
-  request: ProtocolRequest,
-  redirectUrl: string,
-  relPath: string,
-): ProtocolResponse {
-  if (isDevEnv) {
-    return {
-      method:   request.method,
-      referrer: request.referrer,
-      url:      redirectUrl,
-    };
+  if (app.isPackaged) {
+    return path.join(app.getAppPath(), 'dist', 'app', relPath);
   }
 
-  const mimeTypeMap: Record<string, string> = {
-    css:  'text/css',
-    html: 'text/html',
-    js:   'text/javascript',
-    json: 'application/json',
-    png:  'image/png',
-    svg:  'image/svg+xml',
-  };
-  const mimeType = mimeTypeMap[path.extname(relPath).toLowerCase().replace(/^\./, '')];
-
-  return {
-    path:     redirectUrl,
-    mimeType: mimeType || 'text/html',
-  };
+  // Unpackaged non-dev build; this normally means E2E tests, where
+  // `app.getAppPath()` is `.../dist/app.
+  return path.join(process.cwd(), 'dist', 'app', relPath);
 }
 
 // Latch that is set when the app:// protocol handler has been registered.
 // This is used to ensure that we don't attempt to open the window before we've
 // done that, when the user attempts to open a second instance of the window.
-export const protocolRegistered = Latch();
+export const protocolsRegistered = Latch();
 
 /**
  * Set up protocol handler for app://
@@ -68,16 +40,51 @@ export const protocolRegistered = Latch();
  * file:// URLs for our resources. Use the same app:// protocol for both dev and
  * production environments.
  */
-export function setupProtocolHandler() {
-  const registrationProtocol = isDevEnv ? protocol.registerHttpProtocol : protocol.registerFileProtocol;
+function setupAppProtocolHandler() {
+  protocol.handle(
+    'app',
+    (request) => {
+      const relPath = new URL(request.url).pathname;
+      const redirectUrl = redirectedUrl(relPath);
 
-  registrationProtocol('app', (request, callback) => {
-    const relPath = decodeURI(new URL(request.url).pathname);
-    const redirectUrl = redirectedUrl(relPath);
-    const result = getProtocolResponse(request, redirectUrl, relPath);
+      if (isDevBuild) {
+        return net.fetch(redirectUrl);
+      }
 
-    callback(result);
-  });
+      return net.fetch(pathToFileURL(redirectUrl).toString());
+    });
+}
 
-  protocolRegistered.resolve();
+/**
+ * Set up protocol handler for x-rd-extension://
+ *
+ * This handler is used for extensions; the format is:
+ * x-rd-extension://<extension id>/...
+ * Where the extension id is the extension image id, hex encoded (to avoid
+ * issues with slashes).  Base64 was not available in Vue.
+ */
+function setupExtensionProtocolHandler() {
+  protocol.handle(
+    'x-rd-extension',
+    (request) => {
+      const url = new URL(request.url);
+      // Re-encoding the extension ID here also ensures it doesn't contain any
+      // directory traversal etc. issues.
+      const extensionID = Buffer.from(url.hostname, 'hex').toString('base64url');
+      const resourcePath = path.normalize(url.pathname);
+      const filepath = path.join(paths.extensionRoot, extensionID, resourcePath);
+
+      return net.fetch(pathToFileURL(filepath).toString());
+    });
+}
+
+export function setupProtocolHandlers() {
+  try {
+    setupAppProtocolHandler();
+    setupExtensionProtocolHandler();
+
+    protocolsRegistered.resolve();
+  } catch (ex) {
+    console.error('Error registering protocol handlers:', ex);
+  }
 }

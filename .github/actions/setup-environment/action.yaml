@@ -1,0 +1,95 @@
+name: Setup Environment
+description: >-
+  This is a composite action that is used to set up the runner for running
+  Rancher Desktop.
+
+runs:
+  using: composite
+  steps:
+  - name: "Windows: Stop unwanted services"
+    if: runner.os == 'Windows'
+    shell: pwsh
+    run: >-
+      Get-Service -ErrorAction Continue -Name
+      @('W3SVC', 'docker')
+      | Stop-Service
+
+  - name: "Windows: Update any pre-installed WSL"
+    if: runner.os == 'Windows'
+    shell: pwsh
+    run: |
+      # Sometimes this results in a HTTP 403 for some reason; in that case, we
+      # need to retry.
+      do {
+        wsl --update
+      } while ( -not $? )
+      # Setting the default version also lets WSL finish updating.
+      wsl --set-default-version 2
+
+  - name: "Windows: Install yq"
+    if: runner.os == 'Windows'
+    shell: bash
+    run: |
+      set -o xtrace
+      bindir="$HOME/bin"
+      if [[ ! "$PATH" =~ "$bindir" ]]; then
+        bindir=/usr/bin
+      fi
+      if ! command -v yq; then
+        mkdir -p "$bindir"
+        curl --location --output "$bindir/yq.exe" \
+          https://github.com/mikefarah/yq/releases/download/v4.43.1/yq_windows_amd64.exe
+        chmod a+x "$bindir/yq.exe"
+      fi
+
+  - name: "Linux: Enable KVM access"
+    if: runner.os == 'Linux'
+    shell: bash
+    run: sudo chmod a+rwx /dev/kvm
+
+  - name: "Linux: Set unprivileged port start to 80"
+    if: runner.os == 'Linux'
+    shell: bash
+    run: sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80
+
+  - name: "Linux: Initialize pass"
+    if: runner.os == 'Linux'
+    shell: bash
+    run: |
+      source /etc/os-release
+      for id in $ID $ID_LIKE; do
+        case $id in
+          suse|opensuse)
+            sudo zypper --non-interactive install password-store
+            break;;
+          rocky|rhel|centos)
+            sudo dnf install --assumeyes pass
+            break;;
+          debian|ubuntu)
+            sudo apt-get update
+            sudo apt-get install pass
+            break;;
+        esac
+      done
+
+      # Configure the agent to allow default passwords
+      HOMEDIR="$(gpgconf --list-dirs homedir)" # spellcheck-ignore-line
+      mkdir -p "${HOMEDIR}"
+      chmod 0700 "${HOMEDIR}"
+      echo "allow-preset-passphrase" >> "${HOMEDIR}/gpg-agent.conf"
+
+      # Create a GPG key
+      gpg --quick-generate-key --yes --batch --passphrase '' \
+        user@rancher-desktop.test default \
+        default never
+
+      # Get info about the newly created key
+      DATA="$(gpg --batch --with-colons --with-keygrip --list-secret-keys)"
+      FINGERPRINT="$(awk -F: '/^fpr:/ { print $10 ; exit }' <<< "${DATA}")" # spellcheck-ignore-line
+      GRIP="$(awk -F: '/^grp:/ { print $10 ; exit }' <<< "${DATA}")"
+
+      # Save the password
+      gpg-connect-agent --verbose "PRESET_PASSPHRASE ${GRIP} -1 00" /bye
+
+      # Initialize pass
+      pass init "${FINGERPRINT}"

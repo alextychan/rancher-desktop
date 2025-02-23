@@ -1,4 +1,5 @@
 <script>
+
 import { Banner } from '@rancher/components';
 
 import LoadingIndicator from '@pkg/components/LoadingIndicator.vue';
@@ -28,6 +29,10 @@ export default {
     showStatus: {
       type:    Boolean,
       default: true,
+    },
+    imageToPull: {
+      type:    String,
+      default: null,
     },
   },
 
@@ -153,7 +158,7 @@ export default {
           v-if="imageManagerProcessFinishedWithFailure"
           color="error"
         >
-          <span class="icon icon-info icon-lg " />
+          <span class="icon icon-info-circle icon-lg " />
           {{ errorText }}
         </banner>
       </slot>

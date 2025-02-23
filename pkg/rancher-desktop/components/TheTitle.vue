@@ -2,17 +2,14 @@
 import Vue from 'vue';
 import { mapState } from 'vuex';
 
-import DiagnosticsButtonRun from '@pkg/components/DiagnosticsButtonRun.vue';
-import ImagesButtonAdd from '@pkg/components/ImagesButtonAdd.vue';
+const componentCache: { [key: string]: any } = {};
 
 export default Vue.extend({
-  name:       'the-title',
-  components: { ImagesButtonAdd, DiagnosticsButtonRun },
+  name: 'the-title',
   data() {
     return {
-      data() {
-        return { isChild: false };
-      },
+      isChild:          false,
+      dynamicComponent: null,
     };
   },
   computed: {
@@ -22,6 +19,7 @@ export default Vue.extend({
         'title',
         'description',
         'action',
+        'icon',
       ]),
   },
   watch: {
@@ -30,6 +28,15 @@ export default Vue.extend({
       handler(current) {
         this.isChild = current.path.lastIndexOf('/') > 0;
       },
+    },
+    action: {
+      async handler(componentName) {
+        if (componentName) {
+          componentCache[componentName] ||= (await import(`@pkg/components/${ componentName }.vue`)).default;
+          this.dynamicComponent = componentCache[componentName];
+        }
+      },
+      immediate: true,
     },
   },
   methods: {
@@ -63,7 +70,13 @@ export default Vue.extend({
           key="mainTitle"
           data-test="mainTitle"
           class="fade-group-item"
+          :class="icon ? 'main-title-icon' : ''"
         >
+          <span
+            v-if="icon"
+            key="mainTitleIcon"
+            :class="icon"
+          />
           {{ title }}
         </h1>
       </transition-group>
@@ -76,7 +89,7 @@ export default Vue.extend({
           key="actions"
           class="actions fade-actions"
         >
-          <component :is="action" />
+          <component :is="dynamicComponent" />
         </div>
       </transition>
     </div>
@@ -138,6 +151,16 @@ export default Vue.extend({
 
   .title-group {
     display: inherit;
+  }
+
+  .main-title-icon {
+    display: flex;
+    gap: 0.5rem;
+
+    span {
+      font-size: 30px;
+      color: var(--primary);
+    }
   }
 
   .actions {

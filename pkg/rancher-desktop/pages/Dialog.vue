@@ -10,6 +10,7 @@ export default Vue.extend({
   name:       'rd-dialog',
   components: { Checkbox },
   layout:     'dialog',
+
   data() {
     return {
       message:         '',
@@ -21,9 +22,7 @@ export default Vue.extend({
       cancelId:        0,
     };
   },
-  beforeMount() {
-    window.addEventListener('keydown', this.handleKeypress, true);
-  },
+
   mounted() {
     ipcRenderer.on('dialog/options', (_event, options: any) => {
       this.message = options.message;
@@ -36,9 +35,11 @@ export default Vue.extend({
 
     ipcRenderer.send('dialog/mounted');
   },
+
   beforeDestroy() {
-    window.removeEventListener('keydown', this.handleKeypress, true);
+    ipcRenderer.removeAllListeners('dialog/options');
   },
+
   methods: {
     close(index: number) {
       ipcRenderer.send('dialog/close', { response: index, checkboxChecked: this.checkboxChecked });
@@ -46,30 +47,40 @@ export default Vue.extend({
     isDarwin() {
       return os.platform().startsWith('darwin');
     },
-    handleKeypress(event: KeyboardEvent) {
-      if (event.key === 'Escape') {
-        this.close(this.cancelId);
-      }
-    },
   },
 });
 </script>
 
 <template>
   <div class="dialog-container">
-    <div v-if="message" class="message">
+    <div
+      v-if="message"
+      class="message"
+    >
       <slot name="message">
         {{ message }}
       </slot>
     </div>
-    <div v-if="detail" class="detail">
+    <div
+      v-if="detail"
+      class="detail"
+    >
       <slot name="detail">
-        <span class="detail-span" v-html="detail" />
+        <span
+          class="detail-span"
+          v-html="detail"
+        />
       </slot>
     </div>
-    <div v-if="checkboxLabel" class="checkbox">
+    <div
+      v-if="checkboxLabel"
+      class="checkbox"
+    >
       <slot name="checkbox">
-        <checkbox v-model="checkboxChecked" :label="checkboxLabel" />
+        <checkbox
+          v-model="checkboxChecked"
+          :label="checkboxLabel"
+        />
       </slot>
     </div>
     <div

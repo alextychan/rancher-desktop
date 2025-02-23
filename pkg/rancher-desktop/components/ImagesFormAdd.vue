@@ -41,7 +41,7 @@ export default Vue.extend({
     action: {
       type:     String,
       required: true,
-      validator(value) {
+      validator(value: string) {
         return ['pull', 'build'].includes(value);
       },
     },
@@ -74,7 +74,7 @@ export default Vue.extend({
 
   methods: {
     submit() {
-      this.$emit('click', { action: this.action, image: this.image });
+      this.$emit('click', { action: this.action, image: this.image.trim() });
     },
   },
 });

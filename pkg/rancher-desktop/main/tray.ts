@@ -8,32 +8,38 @@ import path from 'path';
 import { KubeConfig } from '@kubernetes/client-node';
 import Electron from 'electron';
 
+import { VMBackend } from '@pkg/backend/backend';
 import { State } from '@pkg/backend/k8s';
 import * as kubeconfig from '@pkg/backend/kubeconfig';
-import { Settings, load } from '@pkg/config/settings';
+import { Settings } from '@pkg/config/settings';
+import { getIpcMainProxy } from '@pkg/main/ipcMain';
 import mainEvents from '@pkg/main/mainEvents';
 import { checkConnectivity } from '@pkg/main/networking';
 import Logging from '@pkg/utils/logging';
+import { networkStatus } from '@pkg/utils/networks';
 import paths from '@pkg/utils/paths';
 import { openMain, send } from '@pkg/window';
 import { openDashboard } from '@pkg/window/dashboard';
+import { openPreferences } from '@pkg/window/preferences';
 
 const console = Logging.background;
-
-enum networkStatus {
-  CHECKING = 'checking...',
-  CONNECTED = 'connected',
-  OFFLINE = 'offline',
-}
+const ipcMainProxy = getIpcMainProxy(console);
 
 /**
  * Tray is a class to manage the tray icon for rancher-desktop.
  */
 export class Tray {
   protected trayMenu: Electron.Tray;
+  protected backendIsLocked = '';
   protected kubernetesState = State.STOPPED;
-  private settings: Settings = load();
+  private settings: Settings;
   private currentNetworkStatus: networkStatus = networkStatus.CHECKING;
+  private static instance: Tray;
+  private networkState: boolean | undefined;
+  private networkInterval: NodeJS.Timeout;
+  private runBuildFromConfigTimer: NodeJS.Timeout | null = null;
+  private kubeConfigWatchers: fs.FSWatcher[] = [];
+  private fsWatcherInterval: NodeJS.Timeout;
 
   protected contextMenuItems: Electron.MenuItemConstructorOptions[] = [
     {
@@ -53,27 +59,33 @@ export class Tray {
     {
       id:      'container-engine',
       enabled: false,
-      label:   `Container engine: ${ this.settings.kubernetes.containerEngine }`,
+      label:   '?',
       type:    'normal',
       icon:    '',
     },
     { type: 'separator' },
     {
+      id:    'main',
+      label: 'Open main window',
+      type:  'normal',
+      click() {
+        openMain();
+      },
+    },
+    {
+      id:    'preferences',
+      label: 'Open preferences dialog',
+      type:  'normal',
+      click: openPreferences,
+    },
+    {
       id:      'dashboard',
       enabled: false,
-      label:   'Dashboard',
+      label:   'Open cluster dashboard',
       type:    'normal',
       click:   openDashboard,
     },
     { type: 'separator' },
-    {
-      id:    'preferences',
-      label: 'Preferences',
-      type:  'normal',
-      click() {
-        openMain(true);
-      },
-    },
     {
       id:      'contexts',
       label:   'Kubernetes Contexts',
@@ -82,6 +94,7 @@ export class Tray {
     },
     { type: 'separator' },
     {
+      id:    'quit',
       label: 'Quit Rancher Desktop',
       role:  'quit',
       type:  'normal',
@@ -90,6 +103,10 @@ export class Tray {
 
   private isMacOs = () => {
     return os.platform() === 'darwin';
+  };
+
+  private isLinux = () => {
+    return os.platform() === 'linux';
   };
 
   private readonly trayIconsMacOs = {
@@ -115,16 +132,19 @@ export class Tray {
    * triggered, close the watcher and restart after a duration (one second).
    */
   private async watchForChanges() {
-    const abortController = new AbortController();
+    for (const watcher of this.kubeConfigWatchers) {
+      watcher.close();
+    }
+    this.kubeConfigWatchers = [];
+
     const paths = await kubeconfig.getKubeConfigPaths();
     const options: fs.WatchOptions = {
       persistent: false,
-      recursive:  true,
+      recursive:  !this.isLinux(), // Recursive not implemented in Linux
       encoding:   'utf-8',
-      signal:     abortController.signal,
     };
 
-    paths.map(filepath => fs.watch(filepath, options, async(eventType) => {
+    this.kubeConfigWatchers = paths.map(filepath => fs.watch(filepath, options, async(eventType) => {
       if (eventType === 'rename') {
         try {
           await fs.promises.access(filepath);
@@ -134,16 +154,24 @@ export class Tray {
         }
       }
 
-      abortController.abort();
-      this.buildFromConfig();
-
-      setTimeout(this.watchForChanges.bind(this), 1_000);
+      // This prevents calling buildFromConfig multiple times in quick succession
+      // while making sure that the last file change within the period is processed.
+      this.runBuildFromConfigTimer ||= setTimeout(() => {
+        this.runBuildFromConfigTimer = null;
+        this.buildFromConfig();
+      }, 1_000);
     }));
   }
 
-  constructor() {
+  private constructor(settings: Settings) {
+    this.settings = settings;
     this.trayMenu = new Electron.Tray(this.trayIconSet.starting);
     this.trayMenu.setToolTip('Rancher Desktop');
+    const menuItem = this.contextMenuItems.find(item => item.id === 'container-engine');
+
+    if (menuItem) {
+      menuItem.label = `Container engine: ${ this.settings.containerEngine.name }`;
+    }
 
     // Discover k8s contexts
     try {
@@ -160,26 +188,94 @@ export class Tray {
     this.buildFromConfig();
     this.watchForChanges();
 
-    mainEvents.on('k8s-check-state', (mgr) => {
-      this.k8sStateChanged(mgr.state);
-    });
-    mainEvents.on('settings-update', (cfg) => {
-      this.settings = cfg;
-      this.settingsChanged();
-    });
+    // We reset the watchers on an interval in the event that `fs.watch` silently
+    // fails to keep watching. This original issue is documented at
+    // https://github.com/rancher-sandbox/rancher-desktop/pull/2038 and further discussed at
+    // https://github.com/rancher-sandbox/rancher-desktop/pull/7238#discussion_r1690128729
+    this.fsWatcherInterval = setInterval(() => this.watchForChanges(), 5 * 60_000);
 
-    /**
-     * This event is called from the renderer, at startup with status based on the navigator object's onLine field,
-     * and on window.online/offline events.
-     * The main process actually checks connectivity to `k3s.io` to verify an online status.
-     *
-     * This system isn't perfect -- if the renderer window is closed when connection status changes, the info is lost.
-     */
-    Electron.ipcMain.on('update-network-status', (_, status: boolean) => {
-      this.handleUpdateNetworkStatus(status).catch((err:any) => {
+    mainEvents.on('backend-locked-update', this.backendStateEvent);
+    mainEvents.emit('backend-locked-check');
+    mainEvents.on('k8s-check-state', this.k8sStateChangedEvent);
+    mainEvents.on('settings-update', this.settingsUpdateEvent);
+
+    // This triggers the CONNECTED_TO_INTERNET diagnostic at a set interval and
+    // updates the network status in the tray if there's a change in the network
+    // state.
+    this.networkInterval = setInterval(async() => {
+      let networkDiagnostic = await mainEvents.invoke('diagnostics-trigger', 'CONNECTED_TO_INTERNET');
+
+      if (Array.isArray(networkDiagnostic)) {
+        networkDiagnostic = networkDiagnostic.shift();
+      }
+      if (this.networkState === networkDiagnostic?.passed) {
+        return; // network state hasn't changed since last check
+      }
+
+      this.networkState = !!networkDiagnostic?.passed;
+
+      this.handleUpdateNetworkStatus(this.networkState).catch((err: any) => {
         console.log('Error updating network status: ', err);
       });
+    }, 5000);
+  }
+
+  private backendStateEvent = (backendIsLocked: string) => {
+    this.backendStateChanged(backendIsLocked);
+  };
+
+  private k8sStateChangedEvent = (mgr: VMBackend) => {
+    this.k8sStateChanged(mgr.state);
+  };
+
+  private settingsUpdateEvent = (cfg: Settings) => {
+    this.settings = cfg;
+    this.settingsChanged();
+  };
+
+  private updateNetworkStatusEvent = (_: Electron.IpcMainEvent, status: boolean) => {
+    this.handleUpdateNetworkStatus(status).catch((err:any) => {
+      console.log('Error updating network status: ', err);
     });
+  };
+
+  /**
+   * Checks for an existing instance of Tray. If one does not
+   * exist, instantiate a new one.
+   */
+  public static getInstance(settings: Settings): Tray {
+    Tray.instance ??= new Tray(settings);
+
+    return Tray.instance;
+  }
+
+  /**
+   * Hide the tray menu.
+   */
+  public hide() {
+    this.trayMenu.destroy();
+    mainEvents.off('k8s-check-state', this.k8sStateChangedEvent);
+    mainEvents.off('settings-update', this.settingsUpdateEvent);
+    ipcMainProxy.removeListener('update-network-status', this.updateNetworkStatusEvent);
+    clearInterval(this.fsWatcherInterval);
+    clearInterval(this.networkInterval);
+    if (this.runBuildFromConfigTimer) {
+      clearTimeout(this.runBuildFromConfigTimer);
+      this.runBuildFromConfigTimer = null;
+    }
+    for (const watcher of this.kubeConfigWatchers) {
+      watcher.close();
+    }
+    this.kubeConfigWatchers = [];
+  }
+
+  /**
+   * Show the tray menu.
+   */
+  public show() {
+    if (this.trayMenu.isDestroyed()) {
+      Tray.instance = new Tray(this.settings);
+    }
   }
 
   protected async handleUpdateNetworkStatus(status: boolean) {
@@ -188,6 +284,7 @@ export class Tray {
     } else {
       this.currentNetworkStatus = await checkConnectivity('k3s.io') ? networkStatus.CONNECTED : networkStatus.OFFLINE;
     }
+    mainEvents.emit('update-network-status', this.currentNetworkStatus === networkStatus.CONNECTED);
     send('update-network-status', this.currentNetworkStatus === networkStatus.CONNECTED);
     this.updateMenu();
   }
@@ -201,6 +298,11 @@ export class Tray {
     } catch (err) {
       console.log(`Error trying to update context menu: ${ err }`);
     }
+  }
+
+  protected backendStateChanged(backendIsLocked: string) {
+    this.backendIsLocked = backendIsLocked;
+    this.updateMenu();
   }
 
   /**
@@ -220,6 +322,10 @@ export class Tray {
   }
 
   protected updateMenu() {
+    if (this.trayMenu.isDestroyed()) {
+      return;
+    }
+
     const labels = {
       [State.STOPPED]:  'Kubernetes is stopped',
       [State.STARTING]: 'Kubernetes is starting',
@@ -258,7 +364,7 @@ export class Tray {
     const containerEngineMenu = this.contextMenuItems.find(item => item.id === 'container-engine');
 
     if (containerEngineMenu) {
-      const { containerEngine } = this.settings.kubernetes;
+      const containerEngine = this.settings.containerEngine.name;
 
       containerEngineMenu.label = containerEngine === 'containerd' ? containerEngine : `dockerd (${ containerEngine })`;
       containerEngineMenu.icon = containerEngine === 'containerd' ? path.join(paths.resources, 'icons', 'containerd-icon-color.png') : '';
@@ -268,6 +374,13 @@ export class Tray {
     if (networkStatusItem) {
       networkStatusItem.label = `Network status: ${ this.currentNetworkStatus }`;
     }
+
+    this.contextMenuItems
+      .filter(item => item.id && ['preferences', 'dashboard', 'contexts', 'quit'].includes(item.id))
+      .forEach((item) => {
+        item.enabled = !this.backendIsLocked;
+      });
+
     const contextMenu = Electron.Menu.buildFromTemplate(this.contextMenuItems);
 
     this.trayMenu.setContextMenu(contextMenu);
@@ -322,8 +435,4 @@ export class Tray {
       this.trayMenu.setContextMenu(contextMenu);
     });
   }
-}
-
-export default function setupTray() {
-  new Tray();
 }

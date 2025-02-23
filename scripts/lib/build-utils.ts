@@ -4,10 +4,11 @@
 
 import childProcess from 'child_process';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import util from 'util';
 
+import spawn from 'cross-spawn';
+import _ from 'lodash';
 import webpack from 'webpack';
 
 import babelConfig from 'babel.config';
@@ -23,9 +24,7 @@ export default {
   /**
    * Determine if we are building for a development build.
    */
-  get isDevelopment() {
-    return /^(?:dev|test)/.test(process.env.NODE_ENV ?? '');
-  },
+  isDevelopment: true,
 
   get serial() {
     return process.argv.includes('--serial');
@@ -80,7 +79,9 @@ export default {
     if (args.concat().pop() instanceof Object) {
       Object.assign(options, args.pop());
     }
-    const child = childProcess.spawn(command, args, options);
+
+    const child = spawn(command, args, options);
+
     const promise: Promise<void> = new Promise((resolve, reject) => {
       child.on('exit', (code, signal) => {
         if (signal && signal !== 'SIGTERM') {
@@ -120,7 +121,7 @@ export default {
   get webpackConfig(): webpack.Configuration {
     const mode = this.isDevelopment ? 'development' : 'production';
 
-    return {
+    const config: webpack.Configuration = {
       mode,
       target: 'electron-main',
       node:   {
@@ -132,7 +133,7 @@ export default {
       devtool:   this.isDevelopment ? 'source-map' : false,
       resolve:   {
         alias:      { '@pkg': path.resolve(this.rootDir, 'pkg', 'rancher-desktop') },
-        extensions: ['.ts', '.js', '.json'],
+        extensions: ['.ts', '.js', '.json', '.node'],
         modules:    ['node_modules'],
       },
       output: {
@@ -144,7 +145,10 @@ export default {
         rules: [
           {
             test: /\.ts$/,
-            use:  { loader: 'ts-loader' },
+            use:  {
+              loader:  'ts-loader',
+              options: { transpileOnly: this.isDevelopment },
+            },
           },
           {
             test: /\.js$/,
@@ -158,8 +162,13 @@ export default {
             exclude: [/node_modules/, this.distDir],
           },
           {
-            test: /\.ya?ml$/,
-            use:  { loader: 'js-yaml-loader' },
+            test:    /\.ya?ml$/,
+            exclude: [/(?:^|[/\\])assets[/\\]scripts[/\\]/, this.distDir],
+            use:     { loader: 'js-yaml-loader' },
+          },
+          {
+            test: /\.node$/,
+            use:  { loader: 'node-loader' },
           },
           {
             test: /(?:^|[/\\])assets[/\\]scripts[/\\]/,
@@ -168,138 +177,77 @@ export default {
         ],
       },
       plugins: [
-        new webpack.EnvironmentPlugin({ NODE_ENV: process.env.NODE_ENV || 'production' }),
+        new webpack.EnvironmentPlugin({ NODE_ENV: mode }),
       ],
     };
+
+    return config;
+  },
+
+  /**
+   * WebPack configuration for the preload script
+   */
+  get webpackPreloadConfig(): webpack.Configuration {
+    const overrides: webpack.Configuration = {
+      target: 'electron-preload',
+      output: {
+        filename: '[name].js',
+        path:     path.join(this.rootDir, 'resources'),
+      },
+    };
+
+    const result = Object.assign({}, this.webpackConfig, overrides);
+    const rules = result.module?.rules ?? [];
+
+    const uses = rules.filter(
+      (rule): rule is webpack.RuleSetRule => typeof rule !== 'boolean' && typeof rule !== 'string',
+    );
+
+    const tsLoader = uses.find(u => u.loader === 'ts-loader');
+
+    if (tsLoader) {
+      tsLoader.options = _.merge({}, tsLoader.options, { compilerOptions: { noEmit: false } });
+    }
+
+    result.entry = { preload: path.resolve(this.rendererSrcDir, 'preload', 'index.ts') };
+
+    return result;
   },
 
   /**
    * Build the main process JavaScript code.
    */
-  buildJavaScript(): Promise<void> {
+  buildJavaScript(config: webpack.Configuration): Promise<void> {
     return new Promise((resolve, reject) => {
-      webpack(this.webpackConfig).run((err, stats) => {
+      webpack(config).run((err, stats) => {
         if (err) {
           return reject(err);
         }
-        if (stats.hasErrors()) {
+        if (stats?.hasErrors()) {
           return reject(new Error(stats.toString({ colors: true, errorDetails: true })));
         }
-        console.log(stats.toString({ colors: true }));
+        console.log(stats?.toString({ colors: true }));
         resolve();
       });
     });
   },
 
-  /** Mapping from the platform name to the Go OS value. */
-  mapPlatformToGoOS(platform: NodeJS.Platform) {
-    switch (platform) {
-    case 'darwin':
-      return 'darwin';
-    case 'linux':
-      return 'linux';
-    case 'win32':
-      return 'windows';
-    default:
-      throw new Error(`Invalid platform "${ platform }"`);
-    }
+  get arch(): NodeJS.Architecture {
+    return process.env.M1 ? 'arm64' : process.arch;
   },
 
   /**
-   * Build the WSL helper application for Windows.
+   * Build the preload script.
    */
-  async buildWSLHelper(): Promise<void> {
-    /**
-     * Build for a single platform
-     * @param platform The platform to build for.
-     */
-    const buildPlatform = async(platform: 'linux' | 'win32') => {
-      const exeName = platform === 'win32' ? 'wsl-helper.exe' : 'wsl-helper';
-      const outFile = path.join(this.rootDir, 'resources', platform, exeName);
-
-      await this.spawn('go', 'build', '-ldflags', '-s -w', '-o', outFile, '.', {
-        cwd: path.join(this.rootDir, 'src', 'go', 'wsl-helper'),
-        env: {
-          ...process.env,
-          GOOS:        this.mapPlatformToGoOS(platform),
-          CGO_ENABLED: '0',
-        },
-      });
-    };
-
-    await this.wait(
-      buildPlatform.bind(this, 'linux'),
-      buildPlatform.bind(this, 'win32'),
-    );
-  },
-
-  /**
-   * Build the nerdctl stub.
-   */
-  async buildNerdctlStub(os: 'windows' | 'linux'): Promise<void> {
-    let platDir, parentDir, outFile;
-
-    if (os === 'windows') {
-      platDir = 'win32';
-      parentDir = path.join(this.rootDir, 'resources', platDir, 'bin');
-      outFile = path.join(parentDir, 'nerdctl.exe');
-    } else {
-      platDir = 'linux';
-      parentDir = path.join(this.rootDir, 'resources', platDir, 'bin');
-      // nerdctl-stub is the actual nerdctl binary to be run on linux;
-      // there is also a `nerdctl` wrapper in the same directory to make it
-      // easier to handle permissions for Linux-in-WSL.
-      outFile = path.join(parentDir, 'nerdctl-stub');
-    }
-    // The linux build produces both nerdctl-stub and nerdctl
-    await this.spawn('go', 'build', '-ldflags', '-s -w', '-o', outFile, '.', {
-      cwd: path.join(this.rootDir, 'src', 'go', 'nerdctl-stub'),
-      env: {
-        ...process.env,
-        GOOS: os,
-      },
-    });
-  },
-
-  /**
-   * Build a golang-based utility for the specified platform.
-   * @param name basename of the executable to build
-   * @param platform 'linux', 'windows', or 'darwin'
-   * @param childDir final folder destination either 'internal' or 'bin'
-   */
-  async buildUtility(name: string, platform: NodeJS.Platform, childDir: string): Promise<void> {
-    const target = platform === 'win32' ? `${ name }.exe` : name;
-    const parentDir = path.join(this.rootDir, 'resources', platform, childDir);
-    const outFile = path.join(parentDir, target);
-
-    await this.spawn('go', 'build', '-ldflags', '-s -w', '-o', outFile, '.', {
-      cwd: path.join(this.rootDir, 'src', 'go', name),
-      env: {
-        ...process.env,
-        GOOS: this.mapPlatformToGoOS(platform),
-      },
-    });
+  async buildPreload(): Promise<void> {
+    await this.buildJavaScript(this.webpackPreloadConfig);
   },
 
   /**
    * Build the main process code.
    */
   buildMain(): Promise<void> {
-    const tasks = [() => this.buildJavaScript()];
-
-    if (os.platform().startsWith('win')) {
-      tasks.push(() => this.buildWSLHelper());
-      tasks.push(() => this.buildNerdctlStub('windows'));
-      tasks.push(() => this.buildNerdctlStub('linux'));
-      tasks.push(() => this.buildUtility('vtunnel', 'linux', 'internal'));
-      tasks.push(() => this.buildUtility('vtunnel', 'win32', 'internal'));
-      tasks.push(() => this.buildUtility('rdctl', 'linux', 'bin'));
-      tasks.push(() => this.buildUtility('privileged-service', 'win32', 'internal'));
-    }
-    tasks.push(() => this.buildUtility('rdctl', os.platform(), 'bin'));
-    tasks.push(() => this.buildUtility('docker-credential-none', os.platform(), 'bin'));
-
-    return this.wait(...tasks);
+    return this.wait(() => this.buildJavaScript(this.webpackConfig));
   },
 
 };

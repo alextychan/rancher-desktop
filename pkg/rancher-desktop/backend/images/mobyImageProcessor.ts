@@ -25,13 +25,24 @@ export default class MobyImageProcessor extends imageProcessor.ImageProcessor {
   }
 
   protected get processorName() {
-    return 'moby';
+    return 'docker';
   }
 
   protected async runImagesCommand(args: string[], sendNotifications = true): Promise<imageProcessor.childResultType> {
     const subcommandName = args[0];
 
-    return await this.processChildOutput(spawn(executable('docker'), args), subcommandName, sendNotifications);
+    if (this.executor.backend !== 'wsl' && !args.includes('--context')) {
+      args.unshift('--context', 'rancher-desktop');
+    }
+
+    return await this.processChildOutput(
+      spawn(executable('docker'), args),
+      {
+        subcommandName,
+        notifications: {
+          stdout: sendNotifications, stderr: sendNotifications, ok: sendNotifications,
+        },
+      });
   }
 
   async buildImage(dirPart: string, filePart: string, taggedImageName: string): Promise<imageProcessor.childResultType> {
@@ -65,15 +76,8 @@ export default class MobyImageProcessor extends imageProcessor.ImageProcessor {
       false);
   }
 
-  async scanImage(taggedImageName: string): Promise<imageProcessor.childResultType> {
-    return await this.runTrivyCommand(
-      [
-        '--quiet',
-        'image',
-        '--format',
-        'json',
-        taggedImageName,
-      ]);
+  scanImage(taggedImageName: string, namespace: string): Promise<imageProcessor.childResultType> {
+    return this.runTrivyScan(taggedImageName);
   }
 
   relayNamespaces(): Promise<void> {
@@ -84,11 +88,6 @@ export default class MobyImageProcessor extends imageProcessor.ImageProcessor {
 
   getNamespaces(): Promise<Array<string>> {
     throw new Error("docker doesn't support namespaces");
-  }
-
-  removeKimBuilder(): Promise<void> {
-    // nothing to do
-    return Promise.resolve();
   }
 
   /**

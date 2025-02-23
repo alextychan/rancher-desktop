@@ -1,15 +1,20 @@
 <template>
   <div>
     <div class="version">
-      <span class="versionInfo"><b>Version:</b> {{ version }}</span>
-      <Checkbox
+      <version />
+      <rd-checkbox
         v-if="updatePossible"
         v-model="updatesEnabled"
         class="updatesEnabled"
         label="Check for updates automatically"
+        :is-locked="autoUpdateLocked"
       />
     </div>
-    <card v-if="hasUpdate" ref="updateInfo" :show-highlight-border="false">
+    <card
+      v-if="hasUpdate"
+      ref="updateInfo"
+      :show-highlight-border="false"
+    >
       <template #title>
         <div class="type-title">
           <h3>Update Available</h3>
@@ -20,32 +25,72 @@
           <p>
             {{ statusMessage }}
           </p>
-          <p v-if="updateReady" class="update-notification">
+          <p
+            v-if="updateReady"
+            class="update-notification"
+          >
             Restart the application to apply the update.
           </p>
         </div>
-        <details v-if="detailsMessage" class="release-notes">
+        <details
+          v-if="detailsMessage"
+          class="release-notes"
+        >
           <summary>Release Notes</summary>
-          <div ref="releaseNotes" v-html="detailsMessage" />
+          <div
+            ref="releaseNotes"
+            v-html="detailsMessage"
+          />
         </details>
       </template>
       <template #actions>
-        <button v-if="updateReady" ref="applyButton" class="btn role-secondary" :disabled="applying" @click="applyUpdate">
+        <button
+          v-if="updateReady"
+          ref="applyButton"
+          class="btn role-secondary"
+          :disabled="applying"
+          @click="applyUpdate"
+        >
           {{ applyMessage }}
         </button>
         <span v-else></span>
+      </template>
+    </card>
+    <card
+      v-else-if="unsupportedUpdateAvailable"
+      :show-highlight-border="false"
+    >
+      <template #title>
+        <div class="type-title">
+          <h3>Latest Version Not Supported</h3>
+        </div>
+      </template>
+      <template #body>
+        <p>
+          A newer version of Rancher Desktop is available, but not supported on your system.
+        </p>
+        <br>
+        <p>
+          For more information please see
+          <a href="https://docs.rancherdesktop.io/getting-started/installation">the installation documentation</a>.
+        </p>
+      </template>
+      <template #actions>
+        <div></div>
       </template>
     </card>
   </div>
 </template>
 
 <script lang="ts">
-import { Card, Checkbox } from '@rancher/components';
+import { Card } from '@rancher/components';
 import DOMPurify from 'dompurify';
 import { marked } from 'marked';
 import Vue from 'vue';
 import Component from 'vue-class-component';
 
+import Version from '@pkg/components/Version.vue';
+import RdCheckbox from '@pkg/components/form/RdCheckbox.vue';
 import { UpdateState } from '@pkg/main/update';
 
 import type { PropType } from 'vue';
@@ -64,14 +109,18 @@ const UpdateStatusProps = Vue.extend({
       type:    String,
       default: undefined,
     },
-    version: {
-      type:    String,
-      default: '(checking...)',
+    isAutoUpdateLocked: {
+      type:    Boolean,
+      default: false,
     },
   },
 });
 
-@Component({ components: { Card, Checkbox } })
+@Component({
+  components: {
+    Version, Card, RdCheckbox,
+  },
+})
 class UpdateStatus extends UpdateStatusProps {
   applying = false;
 
@@ -129,7 +178,11 @@ class UpdateStatus extends UpdateStatusProps {
     if (typeof markdown !== 'string') {
       return undefined;
     }
-    const unsanitized = marked(markdown);
+    // Here's the explanation of the following unorthodox typecast:
+    // The signature of `marked.marked` is, with version 11:
+    // marked(src: string, options?: MarkedOptions): string | Promise<string>
+    // It returns a Promise<string> if `options.async` is true, otherwise a string.
+    const unsanitized = marked(markdown) as string;
 
     return DOMPurify.sanitize(unsanitized, { USE_PROFILES: { html: true } });
   }
@@ -138,9 +191,17 @@ class UpdateStatus extends UpdateStatusProps {
     return this.applying ? 'Applying update...' : 'Restart Now';
   }
 
+  get unsupportedUpdateAvailable() {
+    return !this.hasUpdate && this.updateState?.info?.unsupportedUpdateAvailable;
+  }
+
   applyUpdate() {
     this.applying = true;
     this.$emit('apply');
+  }
+
+  get autoUpdateLocked() {
+    return this.isAutoUpdateLocked;
   }
 }
 
@@ -150,9 +211,7 @@ export default UpdateStatus;
 <style lang="scss" scoped>
   .version {
     display: flex;
-  }
-  .versionInfo {
-    flex: 1;
+    justify-content: space-between
   }
   .update-notification {
     font-weight: 900;

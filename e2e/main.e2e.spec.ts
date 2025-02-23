@@ -1,10 +1,9 @@
-import path from 'path';
-
-import { test, expect } from '@playwright/test';
-import { ElectronApplication, BrowserContext, _electron, Page } from 'playwright';
+import { test, expect, _electron } from '@playwright/test';
 
 import { NavPage } from './pages/nav-page';
-import { createDefaultSettings, packageLogs, reportAsset } from './utils/TestUtils';
+import { createDefaultSettings, startRancherDesktop, teardown } from './utils/TestUtils';
+
+import type { ElectronApplication, Page } from '@playwright/test';
 
 let page: Page;
 
@@ -14,36 +13,15 @@ let page: Page;
  * */
 test.describe.serial('Main App Test', () => {
   let electronApp: ElectronApplication;
-  let context: BrowserContext;
 
-  test.beforeAll(async() => {
+  test.beforeAll(async({ colorScheme }, testInfo) => {
     createDefaultSettings();
 
-    electronApp = await _electron.launch({
-      args: [
-        path.join(__dirname, '../'),
-        '--disable-gpu',
-        '--whitelisted-ips=',
-        // See pkg/rancher-desktop/utils/commandLine.ts before changing the next item as the final option.
-        '--disable-dev-shm-usage',
-        '--no-modal-dialogs',
-      ],
-      env: {
-        ...process.env,
-        RD_LOGS_DIR: reportAsset(__filename, 'log'),
-      },
-    });
-    context = electronApp.context();
-
-    await context.tracing.start({ screenshots: true, snapshots: true });
+    electronApp = await startRancherDesktop(testInfo);
     page = await electronApp.firstWindow();
   });
 
-  test.afterAll(async() => {
-    await context.tracing.stop({ path: reportAsset(__filename) });
-    await packageLogs(__filename);
-    await electronApp.close();
-  });
+  test.afterAll(({ colorScheme }, testInfo) => teardown(electronApp, testInfo));
 
   test('should start loading the background services and hide progress bar', async() => {
     const navPage = new NavPage(page);
@@ -55,7 +33,7 @@ test.describe.serial('Main App Test', () => {
   test('should land on General page', async() => {
     const navPage = new NavPage(page);
 
-    await expect(navPage.mainTitle).toHaveText('Welcome to Rancher Desktop');
+    await expect(navPage.mainTitle).toHaveText('Welcome to Rancher Desktop by SUSE');
   });
 
   test('should navigate to Port Forwarding and check elements', async() => {
@@ -81,7 +59,7 @@ test.describe.serial('Main App Test', () => {
     const troubleshootingPage = await navPage.navigateTo('Troubleshooting');
 
     await expect(navPage.mainTitle).toHaveText('Troubleshooting');
-    await expect(troubleshootingPage.dashboard).toBeVisible();
+    await expect(troubleshootingPage.troubleshooting).toBeVisible();
     await expect(troubleshootingPage.logsButton).toBeVisible();
     await expect(troubleshootingPage.factoryResetButton).toBeVisible();
   });

@@ -3,16 +3,32 @@ import http from 'http';
 import path from 'path';
 import { URL } from 'url';
 
+import express from 'express';
+import _ from 'lodash';
+
+import { State } from '@pkg/backend/backend';
 import type { Settings } from '@pkg/config/settings';
 import type { TransientSettings } from '@pkg/config/transientSettings';
 import type { DiagnosticsResultCollection } from '@pkg/main/diagnostics/diagnostics';
+import { ExtensionMetadata } from '@pkg/main/extensions/types';
 import mainEvents from '@pkg/main/mainEvents';
-import { getVtunnelInstance } from '@pkg/main/networking/vtunnel';
 import * as serverHelper from '@pkg/main/serverHelper';
+import { Snapshot } from '@pkg/main/snapshots/types';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
 import { jsonStringifyWithWhiteSpace } from '@pkg/utils/stringify';
 import { RecursivePartial } from '@pkg/utils/typeUtils';
+
+/**
+ * Represents the current or desired state of the backend/main process.
+ */
+export type BackendState = {
+  // The state of the VM/backend.
+  vmState: State,
+  // Whether the backend is locked. If true, changes cannot
+  // be made by the user until it is unlocked.
+  locked: boolean,
+};
 
 export type ServerState = {
   user: string;
@@ -21,7 +37,8 @@ export type ServerState = {
   pid: number;
 };
 
-type DispatchFunctionType = (request: http.IncomingMessage, response: http.ServerResponse, context: commandContext) => Promise<void>;
+type DispatchFunctionType = (request: express.Request, response: express.Response, context: commandContext) => Promise<void>;
+type HttpMethod = 'get' | 'put' | 'post';
 
 const console = Logging.server;
 const SERVER_PORT = 6107;
@@ -29,8 +46,8 @@ const SERVER_FILE_BASENAME = 'rd-engine.json';
 const MAX_REQUEST_BODY_LENGTH = 4194304; // 4MiB
 
 export class HttpCommandServer {
-  protected vtun = getVtunnelInstance();
   protected server = http.createServer();
+  protected app = express();
   protected readonly externalState: ServerState = {
     user:     'user',
     password: serverHelper.randomStr(),
@@ -47,63 +64,136 @@ export class HttpCommandServer {
 
   protected commandWorker: CommandWorkerInterface;
 
-  protected dispatchTable: Record<string, Record<string, Record<string, DispatchFunctionType>>> = {
-    v0: {
-      GET: {
-        settings:              this.listSettings,
-        diagnostic_categories: this.diagnosticCategories,
-        diagnostic_ids:        this.diagnosticIDsForCategory,
-        diagnostic_checks:     this.diagnosticChecks,
-        transient_settings:    this.listTransientSettings,
+  protected dispatchTable: Record<HttpMethod, Record<string, readonly [number, DispatchFunctionType]>> = _.merge(
+    {
+      get: {
+        '/v1/about':                 [1, this.about],
+        '/v1/diagnostic_categories': [0, this.diagnosticCategories],
+        '/v1/diagnostic_ids':        [0, this.diagnosticIDsForCategory],
+        '/v1/diagnostic_checks':     [0, this.diagnosticChecks],
+        '/v1/settings':              [0, this.listSettings],
+        '/v1/settings/locked':       [0, this.listLockedSettings],
+        '/v1/transient_settings':    [0, this.listTransientSettings],
+        '/v1/backend_state':         [1, this.getBackendState],
       },
-      POST: { diagnostic_checks: this.diagnosticRunChecks },
-      PUT:  {
-        factory_reset:      this.factoryReset,
-        shutdown:           this.wrapShutdown,
-        settings:           this.updateSettings,
-        propose_settings:   this.proposeSettings,
-        transient_settings: this.updateTransientSettings,
+      post: { '/v1/diagnostic_checks': [0, this.diagnosticRunChecks] },
+      put:  {
+        '/v1/factory_reset':      [0, this.factoryReset],
+        '/v1/propose_settings':   [0, this.proposeSettings],
+        '/v1/settings':           [0, this.updateSettings],
+        '/v1/shutdown':           [0, this.wrapShutdown],
+        '/v1/transient_settings': [0, this.updateTransientSettings],
+        '/v1/backend_state':      [1, this.setBackendState],
       },
-    },
-  };
+    } as const,
+    {
+      get:  { '/v1/extensions': [1, this.listExtensions] },
+      post: {
+        '/v1/extensions/install':   [1, this.installExtension],
+        '/v1/extensions/uninstall': [1, this.uninstallExtension],
+      },
+    } as const,
+    {
+      get:  { '/v1/snapshots': [0, this.listSnapshots] },
+      post: {
+        '/v1/snapshots':        [0, this.createSnapshot],
+        '/v1/snapshot/restore': [0, this.restoreSnapshot],
+        '/v1/snapshots/cancel': [0, this.cancelSnapshot],
+      },
+      delete: { '/v1/snapshots': [0, this.deleteSnapshot] },
+    } as const,
+    {
+      post:   { '/v1/port_forwarding': [1, this.createPortForwarding] },
+      delete: { '/v1/port_forwarding': [1, this.deletePortForwarding] },
+    } as const,
+  );
 
   constructor(commandWorker: CommandWorkerInterface) {
     this.commandWorker = commandWorker;
-    mainEvents.on('api-get-credentials', () => {
-      mainEvents.emit('api-credentials', this.interactiveState);
-    });
+    mainEvents.handle('api-get-credentials', () => Promise.resolve(this.interactiveState));
   }
 
   async init() {
     const localHost = '127.0.0.1';
-
-    // The peerPort and upstreamServerAddress port will need to match
-    // this is crucial if we ever pick dynamic ports for upstreamServerAddress
-    if (process.platform === 'win32') {
-      this.vtun.addTunnel({
-        name:                  'CLI Server',
-        handshakePort:         17372,
-        vsockHostPort:         17371,
-        peerAddress:           localHost,
-        peerPort:              SERVER_PORT,
-        upstreamServerAddress: `${ localHost }:${ SERVER_PORT }`,
-      });
-    }
     const statePath = path.join(paths.appHome, SERVER_FILE_BASENAME);
 
     await fs.promises.mkdir(paths.appHome, { recursive: true });
     await fs.promises.writeFile(statePath,
       jsonStringifyWithWhiteSpace(this.externalState),
       { mode: 0o600 });
-    this.server.on('request', this.handleRequest.bind(this));
-    this.server.on('error', (err) => {
-      console.log(`Error: ${ err }`);
-    });
-    this.server.listen(SERVER_PORT, localHost);
+
+    this.server = this.app
+      .disable('etag')
+      .disable('x-powered-by')
+      .use(this.handleCORS)
+      .use(this.checkAuth)
+      .listen(SERVER_PORT, localHost)
+      .on('error', (err) => {
+        console.log(`Error: ${ err }`);
+      });
+
+    this.setupRoutes();
     console.log('CLI server is now ready.');
   }
 
-  protected checkAuth(request: http.IncomingMessage): UserType | false {
+  /**
+   * Set up HTTP routes for express.
+   * This takes the information from the route decorators and applies it to the
+   * express application, handling the extra routes for backwards compatibility
+   * and API listings.
+   */
+  protected setupRoutes() {
+    let maxVersion = 0;
+
+    for (const [untypedMethod, data] of Object.entries(this.dispatchTable)) {
+      const method = untypedMethod as HttpMethod;
+
+      for (const [route, [since, handler]] of Object.entries(data)) {
+        const [, versionString, path] = /^\/v(\d+)\/(.*)$/.exec(route) ?? [];
+        const version = parseInt(versionString || '0', 10);
+
+        if (!versionString || !path) {
+          throw new Error(`Could not parse HTTP route ${ route }`);
+        }
+        maxVersion = Math.max(version, maxVersion);
+
+        this.app[method](`/v${ version }/${ path }`, (req, resp, next) => {
+          const context: commandContext = { interactive: resp.locals.interactive };
+
+          handler.call(this, req, resp, context).catch(next);
+        });
+
+        // Add routes for older API versions
+        for (let oldVersion = since; oldVersion < version; ++oldVersion) {
+          this.app[method](`/v${ oldVersion }/${ path }`, (req, resp, next) => {
+            this.invalidAPIVersionCall(version, req, resp).catch(next);
+          });
+        }
+      }
+    }
+
+    // Add versioned endpoints that list API endpoints
+    for (let listVersion = 0; listVersion <= maxVersion; ++listVersion) {
+      this.app.get(`/v${ listVersion }`, (req, resp) => {
+        this.listEndpoints(listVersion.toString(), req, resp);
+      });
+    }
+
+    this.app.get('/', (req, resp) => {
+      this.listEndpoints('', req, resp);
+    });
+    // Set up catch-all handler for customized HTTP 404 message.
+    this.app.all('*', ({ method, path }, resp) => {
+      console.log(`404: No handler for URL ${ method } ${ path }.`);
+      resp.status(404).type('txt').send(`Unknown command: ${ method } ${ path }`);
+    });
+
+    // The error handler must be set after everything else.
+    this.app.use(this.handleError.bind(this));
+  }
+
+  /** checkAuth is middleware to verify authentication. */
+  protected checkAuth = (request: express.Request, response: express.Response, next: express.NextFunction) => {
     const authHeader = request.headers.authorization ?? '';
     const userDB = {
       [this.externalState.user]:    this.externalState.password,
@@ -112,112 +202,74 @@ export class HttpCommandServer {
 
     switch (serverHelper.basicAuth(userDB, authHeader)) {
     case this.externalState.user:
-      return 'api';
+      response.locals.interactive = false;
+      break;
     case this.interactiveState.user:
-      return 'interactive';
+      response.locals.interactive = true;
+      break;
     default:
-      return false;
+      response.type('txt').sendStatus(401);
+
+      return;
+    }
+    next();
+  };
+
+  /**
+   * Calculate the headers needed for CORS, and set them on the response.
+   */
+  protected handleCORS(request: express.Request, response: express.Response, next: express.NextFunction): void {
+    response.set({
+      'Access-Control-Allow-Headers': 'Authorization',
+      'Access-Control-Allow-Methods': 'GET, PUT, DELETE',
+      'Access-Control-Allow-Origin':  '*',
+    });
+
+    if (request.method === 'OPTIONS') {
+      response.sendStatus(204);
+    } else {
+      next();
     }
   }
 
   /**
-   * Calculate the headers needed for CORS, and sets them on the response.
-   * @returns true if the request has been completely handled.
+   * handleError is middleware to handle unexpected errors, logging the error to
+   * the log file and returning a simpler HTTP internal server error response.
    */
-  protected handleCORS(request: http.IncomingMessage, response: http.ServerResponse): boolean {
-    response.setHeader('Access-Control-Allow-Headers', 'Authorization');
-    response.setHeader('Access-Control-Allow-Methods', 'GET, PUT');
-    response.setHeader('Access-Control-Allow-Origin', '*');
-
-    if (request.method === 'OPTIONS') {
-      response.writeHead(204);
-
-      return true;
+  protected handleError(err: Error, request: express.Request, response: express.Response, next: express.NextFunction): void {
+    if (!err) {
+      next();
     }
 
-    return false;
+    console.log(`Error handling ${ request.path }`, err);
+    response.type('txt').sendStatus(500);
   }
 
-  protected async handleRequest(request: http.IncomingMessage, response: http.ServerResponse) {
-    try {
-      if (this.handleCORS(request, response)) {
-        return;
-      }
-      const userType = this.checkAuth(request);
-
-      if (!userType) {
-        response.writeHead(401, { 'Content-Type': 'text/plain' });
-
-        return;
-      }
-
-      const method = request.method ?? 'GET';
-      const url = new URL(request.url as string, `http://${ request.headers.host }`);
-      const path = url.pathname;
-      const pathParts = path.split('/');
-
-      console.debug(`Processing request ${ method } ${ path }`);
-      if (pathParts.shift()) {
-        response.writeHead(400, { 'Content-Type': 'text/plain' });
-        response.write(`Unexpected data before first / in URL ${ path }`);
-
-        return;
-      }
-      const command = this.lookupCommand(pathParts[0], method, pathParts[1]);
-
-      if (!command) {
-        console.log(`404: No handler for URL ${ method } ${ path }.`);
-        response.writeHead(404, { 'Content-Type': 'text/plain' });
-        response.write(`Unknown command: ${ method } ${ path }`);
-
-        return;
-      }
-      await command.call(this, request, response, { interactive: userType === 'interactive' });
-    } catch (err) {
-      console.log(`Error handling ${ request.url }`, err);
-      response.writeHead(500, { 'Content-Type': 'text/plain' });
-      response.write('Error processing request.');
-    } finally {
-      response.end();
-    }
-  }
-
-  protected lookupCommand(version: string, method: string, commandName: string) {
-    if (commandName) {
-      return this.dispatchTable[version]?.[method]?.[commandName];
-    }
-    if (version === '' || version in this.dispatchTable) {
-      return this.listEndpoints.bind(this, version);
-    }
-
-    return undefined;
-  }
-
-  protected diagnosticCategories(request: http.IncomingMessage, response: http.ServerResponse, context: commandContext): Promise<void> {
+  protected diagnosticCategories(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
     const categories = this.commandWorker.getDiagnosticCategories(context);
 
     if (categories) {
       console.debug('diagnosticCategories: succeeded 200');
-      response.writeHead(200, { 'Content-Type': 'application/json' });
-      response.write(jsonStringifyWithWhiteSpace(categories));
+      response.type('json').status(200)
+        .send(jsonStringifyWithWhiteSpace(categories));
     } else {
       console.debug('diagnosticCategories: failed 404');
-      response.writeHead(404, { 'Content-Type': 'text/plain' });
-      response.write('No diagnostic categories found');
+      response.type('text').status(404)
+        .send('No diagnostic categories found');
     }
 
     return Promise.resolve();
   }
 
-  protected diagnosticIDsForCategory(request: http.IncomingMessage, response: http.ServerResponse, context: commandContext): Promise<void> {
+  protected diagnosticIDsForCategory(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
     const url = new URL(`http://${ request.url }`);
     const searchParams = url.searchParams;
     const category = searchParams.get('category');
 
     if (!category) {
       console.debug('diagnostic_ids: failed 400');
-      response.writeHead(400, { 'Content-Type': 'text/plain' });
-      response.write('diagnostic_ids: no category specified');
+      response.type('txt').status(400)
+        .send('diagnostic_ids: no category specified');
 
       return Promise.resolve();
     }
@@ -225,18 +277,18 @@ export class HttpCommandServer {
 
     if (checkIDs) {
       console.debug('diagnostic_ids: succeeded 200');
-      response.writeHead(200, { 'Content-Type': 'application/json' });
-      response.write(jsonStringifyWithWhiteSpace(checkIDs));
+      response.type('json').status(200)
+        .send(jsonStringifyWithWhiteSpace(checkIDs));
     } else {
       console.debug('diagnostic_ids: failed 404');
-      response.writeHead(404, { 'Content-Type': 'text/plain' });
-      response.write(`No diagnostic checks found in category ${ category }`);
+      response.type('txt').status(404)
+        .send(`No diagnostic checks found in category ${ category }`);
     }
 
     return Promise.resolve();
   }
 
-  protected async diagnosticChecks(request: http.IncomingMessage, response: http.ServerResponse, context: commandContext): Promise<void> {
+  protected async diagnosticChecks(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
     const url = new URL(`http://localhost/${ request.url }`);
     const searchParams = url.searchParams;
     const category = searchParams.get('category');
@@ -244,69 +296,106 @@ export class HttpCommandServer {
     const checks = await this.commandWorker.getDiagnosticChecks(category, id, context);
 
     console.debug('diagnostic_checks: succeeded 200');
-    response.writeHead(200, { 'Content-Type': 'application/json' });
-    response.write(jsonStringifyWithWhiteSpace(checks));
+    response.type('json').status(200)
+      .send(jsonStringifyWithWhiteSpace(checks));
+  }
+
+  protected async diagnosticRunChecks(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
+    const results = await this.commandWorker.runDiagnosticChecks(context);
+
+    console.debug('diagnostic_run: succeeded 200');
+    response.status(200).type('json')
+      .send(jsonStringifyWithWhiteSpace(results));
+  }
+
+  protected invalidAPIVersionCall(neededVersion: number, request: express.Request, response: express.Response): Promise<void> {
+    const method = request.method;
+    const path = request.path;
+    const pathParts = path.split('/');
+
+    const msg = `Invalid version "/${ pathParts[1] }" for endpoint "${ method } ${ path }" - use "/v${ neededVersion }/${ pathParts.slice(2).join('/') }"`;
+
+    console.log(`Error handling ${ request.url }`, msg);
+    response.status(400).type('txt').send(msg);
 
     return Promise.resolve();
   }
 
-  protected async diagnosticRunChecks(request: http.IncomingMessage, response: http.ServerResponse, context: commandContext): Promise<void> {
-    const results = await this.commandWorker.runDiagnosticChecks(context);
+  protected about(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
+    const msg = 'The API is currently at version 1, but is still considered internal and experimental, and is subject to change without any advance notice.';
 
-    console.debug('diagnostic_run: succeeded 200');
-    response.writeHead(200, { 'Content-Type': 'application/json' });
-    response.write(jsonStringifyWithWhiteSpace(results));
+    console.debug('about: succeeded 200');
+    response.status(200).type('txt').send(msg);
+
+    return Promise.resolve();
   }
 
-  protected listSettings(request: http.IncomingMessage, response: http.ServerResponse, context: commandContext): Promise<void> {
+  protected listSettings(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
     const settings = this.commandWorker.getSettings(context);
 
     if (settings) {
       console.debug('listSettings: succeeded 200');
-      response.writeHead(200, { 'Content-Type': 'text/plain' });
-      response.write(settings);
+      response.status(200).type('txt').send(settings);
     } else {
       console.debug('listSettings: failed 200');
-      response.writeHead(404, { 'Content-Type': 'text/plain' });
-      response.write('No settings found');
+      response.status(404).type('txt').send('No settings found');
     }
 
     return Promise.resolve();
   }
 
-  protected getPathsForVersion(version: string, returnedPaths: Array<string[]>): Array<string[]> {
-    const paths = this.dispatchTable[version];
+  protected listLockedSettings(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
+    const settings = this.commandWorker.getLockedSettings(context);
 
-    returnedPaths.push(['GET', `/${ version }`]);
-    for (const method in paths) {
-      for (const path in paths[method]) {
-        returnedPaths.push([method, ['', version, path].join('/')]);
-      }
+    if (settings) {
+      console.debug('listLockedSettings: succeeded 200');
+      response.status(200).type('txt').send(settings);
+    } else {
+      console.debug('listLockedSettings: failed 404');
+      response.status(404).type('txt').send('No locked settings found');
     }
 
-    return returnedPaths;
+    return Promise.resolve();
   }
 
-  protected listEndpoints(version: string, request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
-    const returnedPaths: Array<string[]> = [];
+  protected listEndpoints(version: string, request: express.Request, response: express.Response): Promise<void> {
+    // Determine all API paths, possibly filtered by the requested version.
+    const apiPaths: [Uppercase<HttpMethod>, string][] = [];
+    let maxVersion = 0;
+
+    for (const [method, data] of Object.entries(this.dispatchTable)) {
+      for (const route of Object.keys(data)) {
+        const [, commandVersion] = /\/v(\d+)\//.exec(route) ?? [];
+
+        maxVersion = Math.max(parseInt(commandVersion, 10), maxVersion);
+        if (version && version !== commandVersion) {
+          continue;
+        }
+
+        apiPaths.push([method.toUpperCase() as Uppercase<HttpMethod>, route]);
+      }
+    }
 
     if (version) {
-      this.getPathsForVersion(version, returnedPaths);
+      // If version given, ensure the version endpoint itself is listed.
+      apiPaths.push(['GET', `/v${ version }`]);
     } else {
-      returnedPaths.push(['GET', '/']);
-      for (const version in this.dispatchTable) {
-        this.getPathsForVersion(version, returnedPaths);
+      // If no version is given, provide the unversioned API to list APIs.
+      apiPaths.push(['GET', '/']);
+      for (let listVersion = 0; listVersion <= maxVersion; ++listVersion) {
+        apiPaths.push(['GET', `/v${ listVersion }`]);
       }
     }
-    this.sortFavoringGetMethod(returnedPaths);
+
+    this.sortFavoringGetMethod(apiPaths);
     console.debug('listEndpoints: succeeded 200');
-    response.writeHead(200, { 'Content-Type': 'text/plain' });
-    response.write(JSON.stringify(returnedPaths.map(entry => entry.join(' '))));
+    response.status(200).type('json')
+      .send(JSON.stringify(apiPaths.map(entry => entry.join(' '))));
 
     return Promise.resolve();
   }
 
-  protected sortFavoringGetMethod(returnedPaths: Array<string[]>) {
+  protected sortFavoringGetMethod(returnedPaths: [Uppercase<HttpMethod>, string][]) {
     returnedPaths.sort(([methodA, pathA], [methodB, pathB]) => {
       if (pathA === pathB) {
         if (methodA === 'GET') {
@@ -323,7 +412,7 @@ export class HttpCommandServer {
   }
 
   protected async readRequestSettings<T>(
-    request: http.IncomingMessage,
+    request: express.Request,
     functionName: string,
   ): Promise<[number, string] | RecursivePartial<T>> {
     const [data, payloadError, payloadErrorCode] = await serverHelper.getRequestBody(request, MAX_REQUEST_BODY_LENGTH);
@@ -360,7 +449,7 @@ export class HttpCommandServer {
    *
    * The incoming payload is expected to be a subset of the settings.Settings object
    */
-  async updateSettings(request: http.IncomingMessage, response: http.ServerResponse, context: commandContext): Promise<void> {
+  async updateSettings(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
     let error: string;
     let errorCode = 400;
     let result = '';
@@ -380,16 +469,14 @@ export class HttpCommandServer {
 
     if (error) {
       console.debug(`updateSettings: write back status ${ errorCode }, error: ${ error }`);
-      response.writeHead(errorCode, { 'Content-Type': 'text/plain' });
-      response.write(error);
+      response.status(errorCode).type('txt').send(error);
     } else {
       console.debug(`updateSettings: write back status 202, result: ${ result }`);
-      response.writeHead(202, { 'Content-Type': 'text/plain' });
-      response.write(result);
+      response.status(202).type('txt').send(result);
     }
   }
 
-  async proposeSettings(request: http.IncomingMessage, response: http.ServerResponse, context: commandContext) {
+  async proposeSettings(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
     let error: string;
     let errorCode = 400;
     let result = '';
@@ -409,16 +496,14 @@ export class HttpCommandServer {
     }
     if (error) {
       console.error(`proposeSettings: write back status ${ errorCode }, error: ${ error }`);
-      response.writeHead(errorCode, { 'Content-Type': 'text/plain' });
-      response.write(error);
+      response.status(errorCode).type('txt').send(error);
     } else {
       console.error(`proposeSettings: write back status 200, result: ${ result }`);
-      response.writeHead(200, { 'Content-Type': 'application/json' });
-      response.write(result);
+      response.status(200).type('json').send(result);
     }
   }
 
-  async factoryReset(request: http.IncomingMessage, response: http.ServerResponse, _: commandContext): Promise<void> {
+  async factoryReset(request: express.Request, response: express.Response, _: commandContext): Promise<void> {
     let values: Record<string, any> = {};
     const [data, payloadError] = await serverHelper.getRequestBody(request, MAX_REQUEST_BODY_LENGTH);
     let error = '';
@@ -441,23 +526,109 @@ export class HttpCommandServer {
     }
     if (!error) {
       console.debug('factory reset: succeeded 202');
-      response.writeHead(202, { 'Content-Type': 'text/plain' });
-      response.write('Doing a full factory reset....');
+      response.status(202).type('txt').send('Doing a full factory reset....');
       setImmediate(() => {
         this.closeServer();
         this.commandWorker.factoryReset(keepSystemImages);
       });
     } else {
       console.debug(`factoryReset: write back status 400, error: ${ error }`);
-      response.writeHead(400, { 'Content-Type': 'text/plain' });
-      response.write(error);
+      response.status(400).type('txt').send(error);
     }
   }
 
-  wrapShutdown(request: http.IncomingMessage, response: http.ServerResponse, context: commandContext): Promise<void> {
+  protected async createPortForwarding(request: express.Request, response: express.Response, _: commandContext): Promise<void> {
+    let values: Record<string, any> = {};
+    const [data, payloadError] = await serverHelper.getRequestBody(request, MAX_REQUEST_BODY_LENGTH);
+    let error = '';
+    let namespace = '';
+    let service = '';
+    let k8sPort: string | number = 0;
+    let hostPort = 0;
+
+    if (!payloadError) {
+      try {
+        console.debug(`Request data: ${ data }`);
+        values = JSON.parse(data);
+        if ('namespace' in values && 'service' in values && 'k8sPort' in values && 'hostPort' in values) {
+          namespace = values.namespace;
+
+          service = values.service;
+
+          if (Number.isNaN(values.k8sPort)) {
+            k8sPort = values.k8sPort;
+          } else {
+            k8sPort = parseInt(values.k8sPort, 10);
+          }
+
+          hostPort = values.hostPort;
+        } else {
+          error = 'missing required parameters';
+        }
+      } catch (err) {
+        // TODO: Revisit this log stmt if sensitive values (e.g. PII, IPs, creds) can be provided via this command
+        console.log(`updateSettings: error processing JSON request block\n${ data }\n`, err);
+        error = 'error processing JSON request block';
+      }
+    } else {
+      error = payloadError;
+    }
+    if (!error) {
+      try {
+        const result = await this.commandWorker.forwardPort(namespace, service, k8sPort, hostPort);
+
+        if (typeof result === 'number') {
+          console.debug('createPortForwarding: succeeded 200');
+          response.status(200).type('txt').send(`${ result }`);
+        } else {
+          console.debug(`createPortForwarding: write back status 400, error forwarding port`);
+          response.status(400).type('txt').send('Could not forward port');
+        }
+      } catch (err: any) {
+        console.error(`createPortForwarding: error forwarding port:`, err);
+        response.status(400).type('txt').send(`Could not forward port; error code: ${ typeof err.code === 'string' ? err.code : 'unknown, check the logs' }`);
+      }
+    } else {
+      console.debug(`createPortForwarding: write back status 400, error: ${ error }`);
+      response.status(400).type('txt').send(error);
+    }
+  }
+
+  protected async deletePortForwarding(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
+    const namespace = request.query.namespace ?? '';
+    const service = request.query.service ?? '';
+    const k8sPort = request.query.k8sPort ?? '';
+
+    if (!namespace) {
+      response.status(400).type('txt').send('Port forwarding namespace is required in query parameters');
+    } else if (!service) {
+      response.status(400).type('txt').send('Port forwarding service is required in query parameters');
+    } else if (!k8sPort) {
+      response.status(400).type('txt').send('Port forwarding k8sPort is required in query parameters');
+    } else if (typeof namespace !== 'string') {
+      response.status(400).type('txt').send(`Invalid port forwarding namespace ${ JSON.stringify(namespace) }: not a string.`);
+    } else if (typeof service !== 'string') {
+      response.status(400).type('txt').send(`Invalid port forwarding service ${ JSON.stringify(service) }: not a string.`);
+    } else if (typeof k8sPort !== 'string') {
+      response.status(400).type('txt').send(`Invalid port forwarding k8sPort ${ JSON.stringify(k8sPort) }: not a string.`);
+    } else {
+      const k8sPortResolved = Number.isNaN(k8sPort) ? k8sPort : parseInt(k8sPort, 10);
+
+      try {
+        await this.commandWorker.cancelForward(namespace, service, k8sPortResolved);
+
+        console.debug('deletePortForwarding: succeeded 200');
+        response.status(200).type('txt').send('Port forwarding successfully deleted');
+      } catch (error: any) {
+        console.error(`deletePortForwarding: error deleting port forwarding:`, error);
+        response.status(400).type('txt').send('Could not delete port forwarding');
+      }
+    }
+  }
+
+  wrapShutdown(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
     console.debug('shutdown: succeeded 202');
-    response.writeHead(202, { 'Content-Type': 'text/plain' });
-    response.write('Shutting down.');
+    response.status(202).type('txt').send('Shutting down.');
     setImmediate(() => {
       this.closeServer();
       this.commandWorker.requestShutdown(context);
@@ -470,22 +641,17 @@ export class HttpCommandServer {
     this.server.close();
   }
 
-  protected listTransientSettings(
-    request: http.IncomingMessage,
-    response: http.ServerResponse,
-    context: commandContext,
-  ): Promise<void> {
+  protected listTransientSettings(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
     const transientSettings = this.commandWorker.getTransientSettings(context);
 
-    response.writeHead(200, { 'Content-Type': 'text/plain' });
-    response.write(transientSettings);
+    response.status(200).type('json').send(transientSettings);
 
     return Promise.resolve();
   }
 
   protected async updateTransientSettings(
-    request: http.IncomingMessage,
-    response: http.ServerResponse,
+    request: express.Request,
+    response: express.Response,
     context: commandContext,
   ): Promise<void> {
     let error: string;
@@ -507,17 +673,191 @@ export class HttpCommandServer {
 
     if (error) {
       console.debug(`updateTransientSettings: write back status ${ errorCode }, error: ${ error }`);
-      response.writeHead(errorCode, { 'Content-Type': 'text/plain' });
-      response.write(error);
+      response.status(errorCode).type('txt').send(error);
     } else {
       console.debug(`updateTransientSettings: write back status 202, result: ${ result }`);
-      response.writeHead(202, { 'Content-Type': 'text/plain' });
-      response.write(result);
+      response.status(202).type('txt').send(result);
+    }
+  }
+
+  protected async listExtensions(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
+    const extensions = await this.commandWorker.listExtensions();
+
+    if (!extensions) {
+      response.status(503).type('txt').send('Extension manager is not ready yet.');
+    } else {
+      response.status(200).type('json').send(extensions);
+    }
+  }
+
+  protected async installExtension(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
+    const id = request.query.id ?? '';
+
+    if (!id) {
+      response.status(400).type('txt').send('Extension ID is required in the id= parameter.');
+    } else if (typeof id !== 'string') {
+      response.status(400).type('txt').send(`Invalid extension id ${ JSON.stringify(id) }: not a string.`);
+    } else {
+      response.writeProcessing();
+      const { status, data } = await this.commandWorker.installExtension(id, 'install');
+
+      if (data) {
+        if (typeof data === 'string') {
+          response.status(status).type('txt').send(data);
+        } else {
+          response.status(status).type('json').send(data);
+        }
+      } else {
+        response.sendStatus(status);
+      }
+    }
+  }
+
+  protected async uninstallExtension(request: express.Request, response: express.Response): Promise<void> {
+    const id = request.query.id ?? '';
+
+    if (!id) {
+      response.status(400).type('txt').send('Extension ID is required in the id= parameter.');
+    } else if (typeof id !== 'string') {
+      response.status(400).type('txt').send(`Invalid extension id ${ JSON.stringify(id) }: not a string.`);
+    } else {
+      response.writeProcessing();
+      const { status, data: rawData } = await this.commandWorker.installExtension(id, 'uninstall');
+      const data = rawData || `Deleted ${ id }`;
+
+      if (data) {
+        if (typeof data === 'string') {
+          response.status(status).type('txt').send(data);
+        } else {
+          response.status(status).type('json').send(data);
+        }
+      } else {
+        response.sendStatus(status);
+      }
+    }
+  }
+
+  protected async getBackendState(_: express.Request, response: express.Response, context: commandContext): Promise<void> {
+    const backendState = await this.commandWorker.getBackendState();
+
+    console.debug('GET backend_state: succeeded 200');
+    response.status(200).json(backendState);
+
+    return Promise.resolve();
+  }
+
+  protected async setBackendState(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
+    let result = 'received backend state';
+    let statusCode = 202;
+    const [data] = await serverHelper.getRequestBody(request, MAX_REQUEST_BODY_LENGTH);
+    const state = JSON.parse(data);
+
+    try {
+      await this.commandWorker.setBackendState(state);
+    } catch (ex) {
+      console.error(`error in setBackendState:`, ex);
+      statusCode = 500;
+      result = `internal error: ${ ex }`;
+    }
+    console.debug(`setBackendState: write back status ${ statusCode }, result: ${ result }`);
+    response.status(statusCode).type('txt').send(result);
+
+    return Promise.resolve();
+  }
+
+  protected async listSnapshots(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
+    const snapshots = await this.commandWorker.listSnapshots(context);
+
+    response.status(200).type('json').send(snapshots);
+  }
+
+  protected async createSnapshot(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
+    try {
+      const [data, payloadError] = await serverHelper.getRequestBody(request, MAX_REQUEST_BODY_LENGTH);
+
+      if (payloadError) {
+        response.status(400).type('txt').send('The snapshot is invalid');
+
+        return;
+      }
+
+      const snapshot = JSON.parse(data);
+
+      if (!snapshot.name) {
+        response.status(400).type('txt').send('The name field is required');
+      } else {
+        await this.commandWorker.createSnapshot(context, snapshot);
+
+        response.status(200).type('txt').send('Snapshot successfully created');
+      }
+    } catch (error: any) {
+      if (error.isSnapshotError) {
+        response.status(400).type('txt').send(error.message);
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  protected async restoreSnapshot(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
+    const name = request.query.name ?? '';
+
+    if (!name) {
+      response.status(400).type('txt').send('Snapshot name is required in query parameters');
+    } else if (typeof name !== 'string') {
+      response.status(400).type('txt').send(`Invalid snapshot name ${ JSON.stringify(name) }: not a string.`);
+    } else {
+      try {
+        await this.commandWorker.restoreSnapshot(context, name);
+
+        response.status(200).type('txt').send('Snapshot successfully restored');
+      } catch (error: any) {
+        if (error.isSnapshotError) {
+          response.status(400).type('txt').send(error.message);
+        } else {
+          throw error;
+        }
+      }
+    }
+  }
+
+  protected async cancelSnapshot(_request: express.Request, response: express.Response, _context: commandContext): Promise<void> {
+    await this.commandWorker.cancelSnapshot();
+
+    try {
+      response.status(200).type('txt').send('Snapshot operation canceled');
+    } catch (error: any) {
+      if (error.isSnapshotError) {
+        response.status(400).type('txt').send(error.message);
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  protected async deleteSnapshot(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
+    const name = request.query.name ?? '';
+
+    if (!name) {
+      response.status(400).type('txt').send('Snapshot name is required in query parameters');
+    } else if (typeof name !== 'string') {
+      response.status(400).type('txt').send(`Invalid snapshot name ${ JSON.stringify(name) }: not a string.`);
+    } else {
+      try {
+        await this.commandWorker.deleteSnapshot(context, name);
+
+        response.status(200).type('txt').send('Snapshot successfully deleted');
+      } catch (error: any) {
+        if (error.isSnapshotError) {
+          response.status(400).type('txt').send(error.message);
+        } else {
+          throw error;
+        }
+      }
     }
   }
 }
 
-type UserType = 'api' | 'interactive';
 interface commandContext {
   interactive: boolean;
 }
@@ -531,6 +871,7 @@ interface commandContext {
 export interface CommandWorkerInterface {
   factoryReset: (keepSystemImages: boolean) => void;
   getSettings: (context: commandContext) => string;
+  getLockedSettings: (context: commandContext) => string;
   updateSettings: (context: commandContext, newSettings: RecursivePartial<Settings>) => Promise<[string, string]>;
   proposeSettings: (context: commandContext, newSettings: RecursivePartial<Settings>) => Promise<[string, string]>;
   requestShutdown: (context: commandContext) => void;
@@ -540,6 +881,32 @@ export interface CommandWorkerInterface {
   runDiagnosticChecks: (context: commandContext) => Promise<DiagnosticsResultCollection>;
   getTransientSettings: (context: commandContext) => string;
   updateTransientSettings: (context: commandContext, newTransientSettings: RecursivePartial<TransientSettings>) => Promise<[string, string]>;
+  /** Get the state of the backend */
+  getBackendState: () => Promise<BackendState>;
+  /** Set the desired state of the backend */
+  setBackendState: (state: BackendState) => Promise<void>;
+
+  // #region extensions
+  /**
+   * List the installed extensions with their versions.
+   * If the extension manager is not ready, returns undefined.
+   */
+  listExtensions(): Promise<Record<string, {version: string, metadata: ExtensionMetadata, labels: Record<string, string>}> | undefined>;
+  /**
+   * Install or uninstall the given extension, returning an appropriate HTTP status code.
+   * @param state Whether to install or uninstall the extension.
+   * @returns The HTTP status code, possibly with arbitrary response body data.
+   */
+  installExtension(id: string, state: 'install' | 'uninstall'): Promise<{status: number, data?: any}>;
+  // #endregion
+  listSnapshots: (context: commandContext) => Promise<Snapshot[]>;
+  createSnapshot: (context: commandContext, snapshot: Snapshot) => Promise<void>;
+  deleteSnapshot: (context: commandContext, name: string) => Promise<void>;
+  restoreSnapshot: (context: commandContext, name: string) => Promise<void>;
+  cancelSnapshot: () => Promise<void>;
+
+  forwardPort: (namespace: string, service: string, k8sPort: string | number, hostPort: number) => Promise<number | undefined>;
+  cancelForward: (namespace: string, service: string, k8sPort: string | number) => Promise<void>;
 }
 
 // Extend CommandWorkerInterface to have extra types, as these types are used by

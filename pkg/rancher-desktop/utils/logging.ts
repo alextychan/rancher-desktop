@@ -37,30 +37,59 @@ export function setLogLevel(level: logLevel): void {
 
 export class Log {
   constructor(topic: string, directory = paths.logs) {
-    this.path = path.join(directory, `${ topic }.log`);
-    this.stream = fs.createWriteStream(this.path, { flags: 'w', mode: 0o600 });
-    this.fdPromise = new Promise((resolve) => {
-      this.stream.on('open', resolve);
-    });
-    // If we're running unit tests, output to the console rather than file.
-    // However, _don't_ do so for end-to-end tests in Playwright.
-    // We detect Playwright via the TEST_PARALLEL_INDEX environment variable.
-    // See https://playwright.dev/docs/test-parallel#worker-index-and-parallel-index
-    if (process.env.NODE_ENV === 'test' && !process.env.TEST_PARALLEL_INDEX) {
-      this.console = globalThis.console;
-    } else {
-      this.console = new Console(this.stream);
+    if (process.type === 'renderer') {
+      topic = `${ topic }-renderer`;
     }
+    this.path = path.join(directory, `${ topic }.log`);
+    this.reopen();
+    // The following lines only exist because TypeScript can't reason about
+    // the call to this.reopen() correctly.  They are unused.
+    this.realStream ??= fs.createWriteStream(this.path, { flags: 'ERROR' });
+    this.console ??= globalThis.console;
+    this.fdPromise ??= Promise.reject();
   }
 
   /** The path to the log file. */
   readonly path: string;
 
   /** A stream to write to the log file. */
-  readonly stream: fs.WriteStream;
+  get stream(): fs.WriteStream {
+    return this.realStream;
+  }
 
   /** The underlying console stream. */
-  protected readonly console: Console;
+  protected console: Console;
+
+  protected realStream: fs.WriteStream;
+
+  /**
+   * Reopen the logs; this is necessary after a factory reset because the files
+   * would have been deleted from under us (so reopening ensures any new logs
+   * are readable).
+   * @note This is only used during E2E tests where we do a factory reset.
+   */
+  protected reopen(mode = 'w') {
+    if (process.env.RD_TEST === 'e2e') {
+      // If we're running E2E tests, we may need to create the log directory.
+      // We don't do this normally because it's synchronous and slow.
+      fs.mkdirSync(path.dirname(this.path), { recursive: true });
+    }
+    this.realStream?.close();
+    this.realStream = fs.createWriteStream(this.path, { flags: mode, mode: 0o600 });
+    this.fdPromise = new Promise((resolve) => {
+      this.stream.on('open', resolve);
+    });
+    delete this._fdStream;
+
+    // If we're running unit tests, output to the console rather than file.
+    // However, _don't_ do so for end-to-end tests in Playwright.
+    // We detect Playwright via an environment variable we set in scripts/e2e.ts
+    if (process.env.NODE_ENV === 'test' && process.env.RD_TEST !== 'e2e') {
+      this.console = globalThis.console;
+    } else {
+      this.console = new Console(this.stream);
+    }
+  }
 
   protected fdPromise: Promise<number>;
 
@@ -106,10 +135,6 @@ export class Log {
     this.logWithDate('warn', message, optionalParameters);
   }
 
-  protected logWithDate(method: consoleKey, message: any, optionalParameters: any[]) {
-    this.console[method](`%s: ${ message }`, new Date(), ...optionalParameters);
-  }
-
   /**
    * Log with the given arguments, but only if debug logging is enabled.
    */
@@ -117,6 +142,23 @@ export class Log {
     if (LOG_LEVEL === 'debug') {
       this.log(data, ...args);
     }
+  }
+
+  /**
+   * Log a description and an exception.  If running in development or in test,
+   * include the exception logs.  This is useful for exceptions that are
+   * somewhat expected, but can occasionally be relevant.
+   */
+  debugE(message: string, exception: any) {
+    if (process.env.RD_TEST || process.env.NODE_ENV !== 'production') {
+      this.debug(message, exception);
+    } else {
+      this.debug(`${ message } ${ exception }`);
+    }
+  }
+
+  protected logWithDate(method: consoleKey, message: any, optionalParameters: any[]) {
+    this.console[method](`%s: ${ message }`, new Date().toISOString(), ...optionalParameters);
   }
 
   async sync() {
@@ -155,7 +197,7 @@ export default new Proxy<Module>({}, {
  * the system, so that logs from another instance are not deleted.
  */
 export function clearLoggingDirectory(): void {
-  if (process.env.NODE_ENV === 'test' || process.type !== 'browser') {
+  if (process.env.RD_TEST === 'e2e' || process.type !== 'browser') {
     return;
   }
 
@@ -166,9 +208,24 @@ export function clearLoggingDirectory(): void {
       const topic = path.basename(entry.name, '.log');
 
       if (!logs.has(topic)) {
-        fs.unlinkSync(path.join(paths.logs, entry.name));
+        const fullPath = path.join(paths.logs, entry.name);
+
+        try {
+          fs.unlinkSync(fullPath);
+        } catch (ex: any) {
+          console.log(`Failed to delete log file ${ fullPath }: ${ ex }`);
+        }
       }
     }
+  }
+}
+
+export function reopenLogs() {
+  for (const log of logs.values()) {
+    log['reopen']('a');
+    // Trigger making the stream (by passing it to `Array.of()` and ignoring the
+    // result).
+    Array.of(log.fdStream);
   }
 }
 

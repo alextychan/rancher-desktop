@@ -1,18 +1,26 @@
 package main
 
 import (
+	"bytes"
+	"encoding/csv"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"golang.org/x/sys/unix"
+)
+
+const (
+	// mountPointField is the zero-indexed field number inf /proc/self/mountinfo
+	// that contains the mount point.
+	mountPointField = 4
 )
 
 func spawn(opts spawnOptions) error {
@@ -43,7 +51,7 @@ var workdir string
 
 // Get the WSL mount point; typically, this is /mnt/wsl.
 func getWSLMountPoint() (string, error) {
-	buf, err := ioutil.ReadFile("/proc/self/mountinfo")
+	buf, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
 		return "", fmt.Errorf("error reading mounts: %w", err)
 	}
@@ -53,8 +61,8 @@ func getWSLMountPoint() (string, error) {
 			continue
 		}
 		fields := strings.Split(line, " ")
-		if len(fields) >= 5 {
-			return fields[4], nil
+		if len(fields) > mountPointField {
+			return fields[mountPointField], nil
 		}
 	}
 	return "", fmt.Errorf("could not find WSL mount root")
@@ -64,7 +72,7 @@ func getWSLMountPoint() (string, error) {
 // the system for arg parsing.
 func prepareParseArgs() error {
 	if os.Geteuid() != 0 {
-		return fmt.Errorf("Got unexpected euid %v", os.Geteuid())
+		return fmt.Errorf("got unexpected euid %v", os.Geteuid())
 	}
 	mountPoint, err := getWSLMountPoint()
 	if err != nil {
@@ -171,42 +179,7 @@ func volumeArgHandler(arg string) (string, []cleanupFunc, error) {
 
 // mountArgHandler handles the argument for `nerdctl run --mount=...`
 func mountArgHandler(arg string) (string, []cleanupFunc, error) {
-	var chunks [][]string
-	isBind := false
-	for _, chunk := range strings.Split(arg, ",") {
-		parts := strings.SplitN(chunk, "=", 2)
-		if len(parts) != 2 {
-			// Got something with no value, e.g. --mount=...,readonly,...
-			chunks = append(chunks, []string{chunk})
-			continue
-		}
-		if parts[0] == "type" && parts[1] == "bind" {
-			isBind = true
-		}
-		chunks = append(chunks, parts)
-	}
-	if !isBind {
-		// Not a bind mount; don't attempt to fix anything
-		return arg, nil, nil
-	}
-	for _, chunk := range chunks {
-		if len(chunk) != 2 {
-			continue
-		}
-		if chunk[0] != "source" && chunk[0] != "src" {
-			continue
-		}
-		mountDir, err := doBindMount(chunk[1])
-		if err != nil {
-			return "", nil, err
-		}
-		chunk[1] = mountDir
-	}
-	result := ""
-	for _, chunk := range chunks {
-		result = fmt.Sprintf("%s,%s", result, strings.Join(chunk, "="))
-	}
-	return result[1:], nil, nil // Skip the initial "," we added
+	return mountArgProcessor(arg, doBindMount)
 }
 
 // filePathArgHandler handles arguments that take a file path for input
@@ -259,4 +232,67 @@ func outputPathArgHandler(arg string) (string, []cleanupFunc, error) {
 		return nil
 	}
 	return file.Name(), []cleanupFunc{callback}, nil
+}
+
+// builderCacheArgHandler handles arguments for
+// `nerdctl builder build --cache-from=` and `nerdctl builder build --cache-to=`
+func builderCacheArgHandler(arg string) (string, []cleanupFunc, error) {
+	return builderCacheProcessor(arg, filePathArgHandler, outputPathArgHandler)
+}
+
+// buildContextArgHandler handles arguments for
+// `nerdctl builder build --build-context=`.
+func buildContextArgHandler(arg string) (string, []cleanupFunc, error) {
+	// The arg must be parsed as CSV (!?), and then split on `=` for key-value
+	// pairs; for each value, it is either a URN with a prefix of one of
+	// `urnPrefixes`, or it's a filesystem path.
+
+	var cleanups []cleanupFunc
+	urnPrefixes := []string{"https://", "http://", "docker-image://", "target:", "oci-layout://"}
+	parts, err := csv.NewReader(strings.NewReader(arg)).Read()
+	if err != nil {
+		return "", nil, err
+	}
+	var resultParts []string
+	for _, part := range parts {
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			return "", nil, fmt.Errorf("failed to parse context value %q (expected key=value)", part)
+		}
+		k, v := kv[0], kv[1]
+		matchesPrefix := func(prefix string) bool {
+			return strings.HasPrefix(v, prefix)
+		}
+		if !slices.ContainsFunc(urnPrefixes, matchesPrefix) {
+			mount, newCleanups, err := filePathArgHandler(v)
+			if err != nil {
+				_ = runCleanups(cleanups)
+				return "", nil, err
+			}
+			v = mount
+			cleanups = append(cleanups, newCleanups...)
+		}
+		resultParts = append(resultParts, fmt.Sprintf("%s=%s", k, v))
+	}
+	var result bytes.Buffer
+	writer := csv.NewWriter(&result)
+	if err := writer.Write(resultParts); err != nil {
+		_ = runCleanups(cleanups)
+		return "", nil, err
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return "", nil, err
+	}
+	return strings.TrimSpace(result.String()), cleanups, nil
+}
+
+// argHandlers is the table of argument handlers.
+var argHandlers = argHandlersType{
+	volumeArgHandler:       volumeArgHandler,
+	filePathArgHandler:     filePathArgHandler,
+	outputPathArgHandler:   outputPathArgHandler,
+	mountArgHandler:        mountArgHandler,
+	builderCacheArgHandler: builderCacheArgHandler,
+	buildContextArgHandler: buildContextArgHandler,
 }

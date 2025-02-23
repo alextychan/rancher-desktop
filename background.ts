@@ -4,55 +4,77 @@ import os from 'os';
 import path from 'path';
 import util from 'util';
 
-import Electron from 'electron';
+import Electron, { MessageBoxOptions } from 'electron';
 import _ from 'lodash';
+import semver from 'semver';
 
+import { State } from '@pkg/backend/backend';
 import BackendHelper from '@pkg/backend/backendHelper';
 import K8sFactory from '@pkg/backend/factory';
 import { getImageProcessor } from '@pkg/backend/images/imageFactory';
 import { ImageProcessor } from '@pkg/backend/images/imageProcessor';
 import * as K8s from '@pkg/backend/k8s';
 import { Steve } from '@pkg/backend/steve';
+import { FatalCommandLineOptionError, LockedFieldError, updateFromCommandLine } from '@pkg/config/commandLineOptions';
+import { Help } from '@pkg/config/help';
 import * as settings from '@pkg/config/settings';
+import * as settingsImpl from '@pkg/config/settingsImpl';
 import { TransientSettings } from '@pkg/config/transientSettings';
 import { IntegrationManager, getIntegrationManager } from '@pkg/integrations/integrationManager';
-import { removeLegacySymlinks, PermissionError } from '@pkg/integrations/legacy';
-import { getPathManagerFor, PathManagementStrategy, PathManager } from '@pkg/integrations/pathManager';
-import { CommandWorkerInterface, HttpCommandServer } from '@pkg/main/commandServer/httpCommandServer';
+import { PathManagementStrategy, PathManager } from '@pkg/integrations/pathManager';
+import { getPathManagerFor } from '@pkg/integrations/pathManagerImpl';
+import { BackendState, CommandWorkerInterface, HttpCommandServer } from '@pkg/main/commandServer/httpCommandServer';
 import SettingsValidator from '@pkg/main/commandServer/settingsValidator';
 import { HttpCredentialHelperServer } from '@pkg/main/credentialServer/httpCredentialHelperServer';
 import { DashboardServer } from '@pkg/main/dashboardServer';
+import { DeploymentProfileError, readDeploymentProfiles } from '@pkg/main/deploymentProfiles';
 import { DiagnosticsManager, DiagnosticsResultCollection } from '@pkg/main/diagnostics/diagnostics';
+import { ExtensionErrorCode, isExtensionError } from '@pkg/main/extensions';
 import { ImageEventHandler } from '@pkg/main/imageEvents';
 import { getIpcMainProxy } from '@pkg/main/ipcMain';
 import mainEvents from '@pkg/main/mainEvents';
 import buildApplicationMenu from '@pkg/main/mainmenu';
 import setupNetworking from '@pkg/main/networking';
-import setupTray from '@pkg/main/tray';
+import { Snapshots } from '@pkg/main/snapshots/snapshots';
+import { Snapshot, SnapshotDialog } from '@pkg/main/snapshots/types';
+import { Tray } from '@pkg/main/tray';
 import setupUpdate from '@pkg/main/update';
+import { spawnFile } from '@pkg/utils/childProcess';
 import getCommandLineArgs from '@pkg/utils/commandLine';
 import DockerDirManager from '@pkg/utils/dockerDirManager';
-import { arrayCustomizer } from '@pkg/utils/filters';
-import Logging, { setLogLevel, clearLoggingDirectory } from '@pkg/utils/logging';
+import { isDevEnv } from '@pkg/utils/environment';
+import Logging, { clearLoggingDirectory, setLogLevel } from '@pkg/utils/logging';
+import { fetchMacOsVersion, getMacOsVersion } from '@pkg/utils/osVersion';
 import paths from '@pkg/utils/paths';
-import { setupProtocolHandler, protocolRegistered } from '@pkg/utils/protocols';
+import { protocolsRegistered, setupProtocolHandlers } from '@pkg/utils/protocols';
+import { executable } from '@pkg/utils/resources';
 import { jsonStringifyWithWhiteSpace } from '@pkg/utils/stringify';
-import { RecursivePartial } from '@pkg/utils/typeUtils';
+import { RecursivePartial, RecursiveReadonly } from '@pkg/utils/typeUtils';
 import { getVersion } from '@pkg/utils/version';
+import getWSLVersion from '@pkg/utils/wslVersion';
 import * as window from '@pkg/window';
 import { closeDashboard, openDashboard } from '@pkg/window/dashboard';
-import { preferencesSetDirtyFlag } from '@pkg/window/preferences';
+import { openPreferences, preferencesSetDirtyFlag } from '@pkg/window/preferences';
 
+Electron.app.setPath('userData', path.join(paths.appHome, 'electron'));
 Electron.app.setPath('cache', paths.cache);
 Electron.app.setAppLogsPath(paths.logs);
 
 const console = Logging.background;
+
+// Do an early check for debugging enabled via the environment variable so that
+// we can turn on extra logging to troubleshoot startup issues.
+if (settingsImpl.runInDebugMode(false)) {
+  setLogLevel('debug');
+}
 
 if (!Electron.app.requestSingleInstanceLock()) {
   process.exit(201);
 }
 
 clearLoggingDirectory();
+
+const SNAPSHOT_OPERATION = 'Snapshot operation in progress';
 
 const ipcMainProxy = getIpcMainProxy(console);
 const dockerDirManager = new DockerDirManager(path.join(os.homedir(), '.docker'));
@@ -69,6 +91,10 @@ let enabledK8s: boolean;
 let pathManager: PathManager;
 const integrationManager: IntegrationManager = getIntegrationManager();
 let noModalDialogs = false;
+// Indicates whether the UI should be locked, settings changes should be disallowed
+// and possibly other things should be disallowed. As of the time of writing,
+// set to true when a snapshot is being created or restored.
+let deploymentProfiles: settings.DeploymentProfileType = { defaults: {}, locked: {} };
 
 /**
  * pendingRestartContext is needed because with the CLI it's possible to change
@@ -84,6 +110,16 @@ let pendingRestartContext: CommandWorkerInterface.CommandContext | undefined;
 let httpCommandServer: HttpCommandServer|null = null;
 const httpCredentialHelperServer = new HttpCredentialHelperServer();
 
+if (process.platform === 'linux') {
+  // On Linux, put Electron into a new process group so that we can more
+  // reliably kill processes we spawn from extensions.
+  try {
+    require('posix-node').setpgid(0, 0);
+  } catch (ex) {
+    console.error(`Ignoring error setting process group: ${ ex }`);
+  }
+}
+
 // Scheme must be registered before the app is ready
 Electron.protocol.registerSchemesAsPrivileged([
   { scheme: 'app', privileges: { secure: true, standard: true } },
@@ -98,7 +134,7 @@ process.on('unhandledRejection', (reason: any, promise: any) => {
 });
 
 Electron.app.on('second-instance', async() => {
-  await protocolRegistered;
+  await protocolsRegistered;
   console.warn('A second instance was started');
   if (firstRunDialogComplete) {
     window.openMain();
@@ -109,7 +145,7 @@ Electron.app.on('second-instance', async() => {
 // when settings change
 mainEvents.on('settings-update', async(newSettings) => {
   console.log(`mainEvents settings-update: ${ JSON.stringify(newSettings) }`);
-  const runInDebugMode = settings.runInDebugMode(newSettings.debug);
+  const runInDebugMode = settingsImpl.runInDebugMode(newSettings.application.debug);
 
   if (runInDebugMode) {
     setLogLevel('debug');
@@ -118,23 +154,59 @@ mainEvents.on('settings-update', async(newSettings) => {
   }
   k8smanager.debug = runInDebugMode;
 
-  if (pathManager.strategy !== newSettings.pathManagementStrategy) {
-    await pathManager.remove();
-    pathManager = getPathManagerFor(newSettings.pathManagementStrategy);
-    await pathManager.enforce();
+  if (gone) {
+    console.debug('Suppressing settings-update because app is quitting');
+
+    return;
   }
+
+  await setPathManager(newSettings.application.pathManagementStrategy);
+  await pathManager.enforce();
+
+  if (newSettings.application.hideNotificationIcon) {
+    Tray.getInstance(cfg).hide();
+  } else {
+    if (firstRunDialogComplete) {
+      Tray.getInstance(cfg).show();
+    }
+    mainEvents.emit('k8s-check-state', k8smanager);
+  }
+
+  await runRdctlSetup(newSettings);
+  window.send('preferences/changed');
 });
 
 mainEvents.handle('settings-fetch', () => {
   return Promise.resolve(cfg);
 });
 
+Electron.protocol.registerSchemesAsPrivileged([{ scheme: 'app' }, {
+  scheme:     'x-rd-extension',
+  privileges: {
+    standard:        true,
+    supportFetchAPI: true,
+  },
+}]);
+
 Electron.app.whenReady().then(async() => {
   try {
     const commandLineArgs = getCommandLineArgs();
 
-    installDevtools();
-    setupProtocolHandler();
+    // Normally `noModalDialogs` is set when we call `updateFromCommandLine(.., commandLineArgs)`
+    // But if there's an error either in that function, or before, we'll need to know if we should
+    // display the error in a modal-dialog or not. So check the current command-line arguments for that.
+    //
+    // It's very unlikely that a string option is set to this exact string though.
+    // `rdctl start --images.namespace --no-modal-dialogs`
+    // is syntactically correct, but unlikely (because why would someone create a
+    // containerd namespace called "--no-modal-dialogs"?
+    noModalDialogs = commandLineArgs.includes('--no-modal-dialogs');
+    setupProtocolHandlers();
+
+    // make sure we have the macOS version cached before calling getMacOsVersion()
+    if (os.platform() === 'darwin') {
+      await fetchMacOsVersion(console);
+    }
 
     // Needs to happen before any file is written, otherwise that file
     // could be owned by root, which will lead to future problems.
@@ -145,26 +217,72 @@ Electron.app.whenReady().then(async() => {
     await checkPrerequisites();
 
     DashboardServer.getInstance().init();
+
+    await setupNetworking();
+
+    try {
+      deploymentProfiles = await readDeploymentProfiles();
+    } catch (ex: any) {
+      if (ex instanceof DeploymentProfileError) {
+        await handleFailure(ex);
+      } else {
+        console.log(`Got an unexpected deployment profile error ${ ex }`, ex);
+      }
+
+      throw ex;
+    }
+    try {
+      cfg = settingsImpl.load(deploymentProfiles);
+      settingsImpl.updateLockedFields(deploymentProfiles.locked);
+    } catch (err: any) {
+      const titlePart = err.name || 'Failed to load settings';
+      const message = err.message || err.toString();
+
+      showErrorDialog(titlePart, message, true);
+
+      // showErrorDialog doesn't exit immediately; avoid running the rest of the function
+      return;
+    }
+    try {
+      // The profile loader did rudimentary type-validation on profiles, but the validator checks for things
+      // like invalid strings for application.pathManagementStrategy.
+      validateEarlySettings(settings.defaultSettings, deploymentProfiles.defaults, {});
+      validateEarlySettings(settings.defaultSettings, deploymentProfiles.locked, {});
+
+      if (commandLineArgs.length) {
+        cfg = updateFromCommandLine(cfg, settingsImpl.getLockedSettings(), commandLineArgs);
+        k8smanager.noModalDialogs = noModalDialogs = TransientSettings.value.noModalDialogs;
+      }
+    } catch (err: any) {
+      noModalDialogs = TransientSettings.value.noModalDialogs;
+      if (err instanceof LockedFieldError || err instanceof DeploymentProfileError || err instanceof FatalCommandLineOptionError) {
+        handleFailure(err).catch((err2: any) => {
+          console.log('Internal error trying to show a failure dialog: ', err2);
+          process.exit(2);
+        });
+
+        // Avoid running the rest of the `whenReady` handler after calling this handleFailure -- shutdown is imminent
+        return;
+      } else if (!noModalDialogs) {
+        showErrorDialog('Invalid command-line arguments', err.message, false);
+      }
+      console.log(`Failed to update command from argument ${ commandLineArgs.join(', ') }`, err);
+    }
+
     httpCommandServer = new HttpCommandServer(new BackgroundCommandWorker());
     await httpCommandServer.init();
     await httpCredentialHelperServer.init();
-    await setupNetworking();
-    cfg = settings.load();
 
-    if (commandLineArgs.length) {
-      try {
-        cfg = settings.updateFromCommandLine(cfg, commandLineArgs);
-        k8smanager.noModalDialogs = noModalDialogs = TransientSettings.value.noModalDialogs;
-      } catch (err) {
-        console.log(`Failed to update command from argument ${ commandLineArgs } `, err);
-      }
-    }
-    pathManager = getPathManagerFor(cfg.pathManagementStrategy);
+    await initUI();
+    await checkForBackendLock();
+    await setPathManager(cfg.application.pathManagementStrategy);
+    await integrationManager.enforce();
+
     mainEvents.emit('settings-update', cfg);
 
     // Set up the updater; we may need to quit the app if an update is already
     // queued.
-    if (await setupUpdate(cfg.updater, true)) {
+    if (await setupUpdate(cfg.application.updater.enabled, true)) {
       gone = true;
       // The update code will trigger a restart; don't do it here, as it may not
       // be ready yet.
@@ -173,75 +291,148 @@ Electron.app.whenReady().then(async() => {
       return;
     }
 
-    await integrationManager.enforce();
-    await doFirstRunDialog();
+    try {
+      await dockerDirManager.ensureCredHelperConfigured();
+    } catch (ex: any) {
+      const errorTitle = 'Error configuring credential helper';
 
-    if (gone) {
-      console.log('User triggered quit during first-run');
+      console.error(`${ errorTitle }:`, ex);
 
-      return;
-    }
+      const title = ex.title ?? errorTitle;
+      const message = ex.message ?? ex.toString();
 
-    buildApplicationMenu();
-
-    Electron.app.setAboutPanelOptions({
-      copyright:          'Copyright © 2021-2022 SUSE LLC', // TODO: Update this to 2021-... as dev progresses
-      applicationName:    Electron.app.name,
-      applicationVersion: `Version ${ await getVersion() }`,
-      iconPath:           path.join(paths.resources, 'icons', 'logo-square-512.png'),
-    });
-
-    setupTray();
-    window.openMain();
-
-    dockerDirManager.ensureCredHelperConfigured();
-
-    // Path management strategy will need to be selected after an upgrade
-    if (!os.platform().startsWith('win') && cfg.pathManagementStrategy === PathManagementStrategy.NotSet) {
-      if (!noModalDialogs) {
-        await window.openPathUpdate();
-      } else {
-        cfg.pathManagementStrategy = PathManagementStrategy.RcFiles;
-      }
-    }
-
-    if (os.platform() === 'linux' || os.platform() === 'darwin') {
-      try {
-        await removeLegacySymlinks(paths.oldIntegration);
-      } catch (error) {
-        if (error instanceof PermissionError) {
-          await window.openLegacyIntegrations();
-        } else {
-          throw error;
-        }
-      }
+      showErrorDialog(title, message, true);
     }
 
     diagnostics.runChecks().catch(console.error);
 
-    await startBackend(cfg);
-  } catch (ex) {
-    console.error('Error starting up:', ex);
+    await startBackend();
+  } catch (ex: any) {
+    console.error(`Error starting up: ${ ex }`, ex.stack);
     gone = true;
     Electron.app.quit();
   }
 });
 
-function installDevtools() {
-  if (Electron.app.isPackaged) {
+async function setPathManager(newStrategy: PathManagementStrategy) {
+  if (pathManager) {
+    if (pathManager.strategy === newStrategy) {
+      return;
+    }
+    await pathManager.remove();
+  }
+  pathManager = getPathManagerFor(newStrategy);
+}
+
+/**
+ * Reads the 'backend.lock' file and returns its contents if it exists.
+ * Returns null if the file doesn't exist.
+ */
+async function readBackendLockFile(): Promise<{ action: string } | null> {
+  try {
+    const fileContents = await fs.promises.readFile(
+      path.join(paths.appHome, 'backend.lock'),
+      'utf-8',
+    );
+
+    return JSON.parse(fileContents);
+  } catch (ex: any) {
+    if (ex.code === 'ENOENT') {
+      return null;
+    } else {
+      throw ex;
+    }
+  }
+}
+
+/**
+ * Emits the 'backend-locked-update' event.
+ */
+function updateBackendLockState(backendIsLocked: string, action?: string): void {
+  mainEvents.emit('backend-locked-update', backendIsLocked, action);
+}
+
+/**
+ * Checks for the existence of the 'backend.lock' file and emits the
+ * 'backend-locked-update' event to notify listeners about the current lock
+ * status.
+ */
+async function doesBackendLockExist(): Promise<boolean> {
+  let backendIsLocked = '';
+
+  const lockFileContents = await readBackendLockFile();
+
+  if (lockFileContents !== null) {
+    backendIsLocked = SNAPSHOT_OPERATION;
+    updateBackendLockState(backendIsLocked, lockFileContents.action);
+  } else {
+    backendIsLocked = '';
+    updateBackendLockState(backendIsLocked);
+  }
+
+  return !!backendIsLocked;
+}
+
+/**
+ * Blocks execution until the 'backend.lock' file is no longer present.
+ */
+async function checkForBackendLock() {
+  // Perform an initial check for a lock file
+  if (!await doesBackendLockExist()) {
     return;
   }
 
-  const { default: installExtension, VUEJS_DEVTOOLS } = require('electron-devtools-installer');
+  const startTime = Date.now();
 
-  // No need to wait for it to complete, but handle any errors asynchronously
-  installExtension(VUEJS_DEVTOOLS).catch((err: any) => {
-    console.log(`Error installing VUEJS_DEVTOOLS: ${ err }`);
+  // Check every second if a lock file exists
+  while (await doesBackendLockExist()) {
+    // Notify when a lock file has existed for more than 5 minutes
+    if (Date.now() - startTime >= 300_000) {
+      mainEvents.emit(
+        'dialog-info',
+        {
+          dialog:  'SnapshotsDialog',
+          infoKey: 'snapshots.info.lock.info',
+        },
+      );
+    }
+    await util.promisify(setTimeout)(1_000);
+  }
+}
+
+async function initUI() {
+  await doFirstRunDialog();
+
+  if (gone) {
+    console.log('User triggered quit during first-run');
+
+    return;
+  }
+
+  buildApplicationMenu();
+
+  Electron.app.setAboutPanelOptions({
+    // TODO: Update this to 2021-... as dev progresses
+    // also needs to be updated in electron-builder.yml
+    copyright:          'Copyright © 2021-2023 SUSE LLC',
+    applicationName:    `${ Electron.app.name } by SUSE`,
+    applicationVersion: `Version ${ await getVersion() }`,
+    iconPath:           path.join(paths.resources, 'icons', 'logo-square-512.png'),
   });
+
+  if (!cfg.application.hideNotificationIcon) {
+    Tray.getInstance(cfg).show();
+  }
+
+  if (!cfg.application.startInBackground) {
+    window.openMain();
+  } else if (Electron.app.dock) {
+    Electron.app.dock.hide();
+  }
 }
 
 async function doFirstRunDialog() {
-  if (settings.firstRunDialogNeeded()) {
+  if (!noModalDialogs && settingsImpl.firstRunDialogNeeded()) {
     await window.openFirstRunDialog();
   }
   firstRunDialogComplete = true;
@@ -258,6 +449,7 @@ async function checkForRootPrivs() {
 async function checkPrerequisites() {
   const osPlatform = os.platform();
   let messageId: window.reqMessageId = 'ok';
+  let args: any[] = [];
 
   switch (osPlatform) {
   case 'win32': {
@@ -266,6 +458,17 @@ async function checkPrerequisites() {
 
     if (Number(winRel[0]) < 10 || (Number(winRel[0]) === 10 && Number(winRel[2]) < 18363)) {
       messageId = 'win32-release';
+    } else {
+      try {
+        const version = await getWSLVersion();
+
+        if (version.outdated_kernel) {
+          messageId = 'win32-kernel';
+          args = [version];
+        }
+      } catch (ex) {
+        console.error(`Failed to check WSL version, ignoring:`, ex);
+      }
     }
     break;
   }
@@ -288,16 +491,17 @@ async function checkPrerequisites() {
     }
     break;
   }
-  case 'darwin':
-    // Required: MacOS-10.15(Darwin-19) or newer
-    if (parseInt(os.release()) < 19) {
+  case 'darwin': {
+    // Required: macOS-10.15(Darwin-19) or newer
+    if (semver.gt('10.15.0', getMacOsVersion())) {
       messageId = 'macOS-release';
     }
     break;
   }
+  }
 
   if (messageId !== 'ok') {
-    await window.openUnmetPrerequisitesDialog(messageId);
+    await window.openUnmetPrerequisitesDialog(messageId, ...args);
     gone = true;
     Electron.app.quit();
   }
@@ -322,12 +526,30 @@ async function checkBackendValid() {
  *
  * @precondition cfg.kubernetes.version is set.
  */
-async function startBackend(cfg: settings.Settings) {
+async function startBackend() {
   await checkBackendValid();
+
+  // A string describing why we're ignoring the request.
+  const ignoreReason = {
+    [K8s.State.STOPPED]:  undefined, // Normal start is accepted.
+    [K8s.State.STARTING]: 'Ignoring duplicate attempt to start backend while starting backend.',
+    [K8s.State.STARTED]:  'Ignoring attempt to start already-started backend.',
+    [K8s.State.STOPPING]: 'Ignoring attempt to start backend while stopping.',
+    [K8s.State.ERROR]:    undefined, // Attempting start from error state is fine.
+    [K8s.State.DISABLED]: 'Ignoring attempt to start already-started backend (Kubernetes disabled).',
+  }[k8smanager.state];
+
+  if (ignoreReason) {
+    console.debug(ignoreReason);
+
+    return;
+  }
   try {
     await startK8sManager();
   } catch (err) {
     handleFailure(err);
+  } finally {
+    window.send('extensions/changed');
   }
 }
 
@@ -337,15 +559,20 @@ async function startBackend(cfg: settings.Settings) {
  * @note Callers are responsible for handling errors thrown from here.
  */
 async function startK8sManager() {
-  const changedContainerEngine = currentContainerEngine !== cfg.kubernetes.containerEngine;
+  const changedContainerEngine = currentContainerEngine !== cfg.containerEngine.name;
 
-  currentContainerEngine = cfg.kubernetes.containerEngine;
+  currentContainerEngine = cfg.containerEngine.name;
   enabledK8s = cfg.kubernetes.enabled;
 
   if (changedContainerEngine) {
     setupImageProcessor();
   }
   await k8smanager.start(cfg);
+
+  const { initializeExtensionManager } = await import('@pkg/main/extensions/manager');
+
+  await initializeExtensionManager(k8smanager.containerEngineClient, cfg);
+  window.send('extensions/changed');
 }
 
 /**
@@ -359,17 +586,18 @@ async function startK8sManager() {
  */
 
 function setupImageProcessor() {
-  const imageProcessor = getImageProcessor(cfg.kubernetes.containerEngine, k8smanager.executor);
+  const imageProcessor = getImageProcessor(cfg.containerEngine.name, k8smanager.executor);
 
   currentImageProcessor?.deactivate();
   if (!imageEventHandler) {
     imageEventHandler = new ImageEventHandler(imageProcessor);
   }
+
   imageEventHandler.imageProcessor = imageProcessor;
   currentImageProcessor = imageProcessor;
-  currentImageProcessor.activate();
+  currentImageProcessor?.activate();
   currentImageProcessor.namespace = cfg.images.namespace;
-  window.send('k8s-current-engine', cfg.kubernetes.containerEngine);
+  window.send('k8s-current-engine', cfg.containerEngine.name);
 }
 
 interface K8sError {
@@ -391,13 +619,13 @@ Electron.app.on('before-quit', async(event) => {
   httpCredentialHelperServer.closeServer();
 
   try {
+    await mainEvents.tryInvoke('extensions/shutdown');
     await k8smanager?.stop();
+    await mainEvents.tryInvoke('shutdown-integrations');
 
     console.log(`2: Child exited cleanly.`);
-  } catch (ex) {
-    if (isK8sError(ex)) {
-      console.log(`2: Child exited with code ${ ex.errCode }`);
-    }
+  } catch (ex: any) {
+    console.log(`2: Child exited with code ${ isK8sError(ex) ? ex.errCode : (ex.errCode ?? '<unknown>') }`);
     handleFailure(ex);
   } finally {
     gone = true;
@@ -421,8 +649,24 @@ Electron.app.on('activate', async() => {
 
     return;
   }
-  await protocolRegistered;
+  await protocolsRegistered;
   window.openMain();
+});
+
+mainEvents.on('backend-locked-update', (backendIsLocked, action) => {
+  if (backendIsLocked) {
+    window.send('backend-locked', action);
+  } else {
+    window.send('backend-unlocked');
+  }
+});
+
+mainEvents.on('backend-locked-check', async() => {
+  await doesBackendLockExist();
+});
+
+ipcMainProxy.on('backend-state-check', async() => {
+  await doesBackendLockExist();
 });
 
 ipcMainProxy.on('settings-read', (event) => {
@@ -451,7 +695,7 @@ ipcMainProxy.on('dashboard-close', () => {
 });
 
 ipcMainProxy.on('preferences-open', () => {
-  window.openMain(true);
+  openPreferences();
 });
 
 ipcMainProxy.on('preferences-close', () => {
@@ -462,10 +706,12 @@ ipcMainProxy.on('preferences-set-dirty', (_event, dirtyFlag) => {
   preferencesSetDirtyFlag(dirtyFlag);
 });
 
-function writeSettings(arg: RecursivePartial<settings.Settings>) {
-  // arrayCustomizer is necessary to properly merge array of strings
-  _.mergeWith(cfg, arg, arrayCustomizer);
-  settings.save(cfg);
+ipcMainProxy.on('get-debugging-statuses', () => {
+  window.send('is-debugging', settingsImpl.runInDebugMode(cfg.application.debug));
+  window.send('always-debugging', settingsImpl.runInDebugMode(false));
+});
+function writeSettings(arg: RecursivePartial<RecursiveReadonly<settings.Settings>>) {
+  settingsImpl.save(settingsImpl.merge(cfg, arg));
   mainEvents.emit('settings-update', cfg);
 }
 
@@ -481,6 +727,22 @@ ipcMainProxy.handle('settings-write', (event, arg) => {
 });
 
 mainEvents.on('settings-write', writeSettings);
+
+mainEvents.on('extensions/ui/uninstall', (id) => {
+  window.send('ok:extensions/uninstall', id);
+});
+
+mainEvents.on('dialog-info', (args) => {
+  window.getWindow(args.dialog)?.webContents.send('dialog/info', args);
+});
+
+ipcMainProxy.on('extensions/open', (_event, id, path) => {
+  window.openExtension(id, path);
+});
+
+ipcMainProxy.on('extensions/close', () => {
+  window.closeExtension();
+});
 
 ipcMainProxy.handle('transient-settings-fetch', () => {
   return Promise.resolve(TransientSettings.value);
@@ -506,20 +768,9 @@ ipcMainProxy.on('k8s-reset', async(_, arg) => {
   await doK8sReset(arg, { interactive: true });
 });
 
-ipcMainProxy.on('api-get-credentials', () => {
-  mainEvents.emit('api-get-credentials');
-});
+ipcMainProxy.handle('api-get-credentials', () => mainEvents.invoke('api-get-credentials'));
 
-Electron.ipcMain.handle('api-get-credentials', () => {
-  return new Promise<void>((resolve) => {
-    mainEvents.once('api-credentials', resolve);
-    mainEvents.emit('api-get-credentials');
-  });
-});
-
-mainEvents.on('api-credentials', (credentials) => {
-  window.send('api-credentials', credentials);
-});
+ipcMainProxy.handle('get-locked-fields', () => settingsImpl.getLockedSettings());
 
 function backendIsBusy() {
   return [K8s.State.STARTING, K8s.State.STOPPING].includes(k8smanager.state);
@@ -544,13 +795,9 @@ async function doK8sReset(arg: 'fast' | 'wipe' | 'fullRestart', context: Command
       await startK8sManager();
       break;
     case 'wipe':
-      await k8smanager.stop();
-
-      console.log(`Stopped Kubernetes backend cleanly.`);
       console.log('Deleting VM to reset...');
       await k8smanager.del();
       console.log(`Deleted VM to reset exited cleanly.`);
-
       await startK8sManager();
       break;
     }
@@ -567,7 +814,7 @@ ipcMainProxy.on('k8s-restart', async() => {
   if (cfg.kubernetes.port !== k8smanager.kubeBackend.desiredPort) {
     // On port change, we need to wipe the VM.
     return doK8sReset('wipe', { interactive: true });
-  } else if (cfg.kubernetes.containerEngine !== currentContainerEngine || cfg.kubernetes.enabled !== enabledK8s) {
+  } else if (cfg.containerEngine.name !== currentContainerEngine || cfg.kubernetes.enabled !== enabledK8s) {
     return doK8sReset('fullRestart', { interactive: true });
   }
   try {
@@ -586,11 +833,23 @@ ipcMainProxy.on('k8s-restart', async() => {
 });
 
 ipcMainProxy.on('k8s-versions', async() => {
-  window.send('k8s-versions', await k8smanager.kubeBackend.availableVersions, await k8smanager.kubeBackend.cachedVersionsOnly());
+  try {
+    const versions = await k8smanager.kubeBackend.availableVersions;
+    const cachedOnly = await k8smanager.kubeBackend.cachedVersionsOnly();
+
+    window.send('k8s-versions', versions.map(v => v.versionEntry), cachedOnly);
+  } catch (ex) {
+    console.error(`Error handling k8s-versions: ${ ex }`);
+    window.send('k8s-versions', [], true);
+  }
 });
 
 ipcMainProxy.on('k8s-progress', () => {
   window.send('k8s-progress', k8smanager.progress);
+});
+
+ipcMainProxy.handle('k8s-progress', () => {
+  return k8smanager.progress;
 });
 
 ipcMainProxy.handle('service-fetch', (_, namespace) => {
@@ -603,18 +862,26 @@ ipcMainProxy.handle('service-forward', async(_, service, state) => {
   if (state) {
     const hostPort = service.listenPort ?? 0;
 
-    await k8smanager.kubeBackend.forwardPort(namespace, service.name, service.port, hostPort);
+    await doForwardPort(namespace, service.name, service.port, hostPort);
   } else {
-    await k8smanager.kubeBackend.cancelForward(namespace, service.name, service.port);
+    await doCancelForward(namespace, service.name, service.port);
   }
 });
+
+async function doForwardPort(namespace: string, service: string, k8sPort: string | number, hostPort: number) {
+  return await k8smanager.kubeBackend.forwardPort(namespace, service, k8sPort, hostPort);
+}
+
+async function doCancelForward(namespace: string, service: string, k8sPort: string | number) {
+  return await k8smanager.kubeBackend.cancelForward(namespace, service, k8sPort);
+}
 
 ipcMainProxy.on('k8s-integrations', async() => {
   mainEvents.emit('integration-update', await integrationManager.listIntegrations() ?? {});
 });
 
 ipcMainProxy.on('k8s-integration-set', (event, name, newState) => {
-  writeSettings({ kubernetes: { WSLIntegrations: { [name]: newState } } });
+  writeSettings({ WSL: { integrations: { [name]: newState } } });
 });
 
 mainEvents.on('integration-update', (state) => {
@@ -636,7 +903,7 @@ async function doFactoryReset(keepSystemImages: boolean) {
   const outfile = await fs.promises.open(path.join(tmpdir, 'rdctl-stdout.txt'), 'w');
   const args = ['factory-reset', `--remove-kubernetes-cache=${ (!keepSystemImages) ? 'true' : 'false' }`];
 
-  if (cfg.debug) {
+  if (cfg.application.debug) {
     args.push('--verbose=true');
   }
   const rdctl = spawn(path.join(paths.resources, os.platform(), 'bin', 'rdctl'), args,
@@ -657,7 +924,7 @@ ipcMainProxy.on('show-logs', async(event) => {
 
   if (error) {
     const browserWindow = Electron.BrowserWindow.fromWebContents(event.sender);
-    const options = {
+    const options: MessageBoxOptions = {
       message: error,
       type:    'error',
       title:   `Error opening logs`,
@@ -681,11 +948,39 @@ ipcMainProxy.on('get-app-version', async(event) => {
   event.reply('get-app-version', await getVersion());
 });
 
-ipcMainProxy.handle('show-message-box', (_event, options: Electron.MessageBoxOptions, modal = false): Promise<Electron.MessageBoxReturnValue> => {
-  return window.showMessageBox(options, modal);
+ipcMainProxy.on('snapshot', (event, args) => {
+  event.reply('snapshot', args);
 });
 
-Electron.ipcMain.handle('show-message-box-rd', async(_event, options: Electron.MessageBoxOptions, modal = false) => {
+ipcMainProxy.on('snapshot/cancel', () => {
+  window.send('snapshot/cancel');
+});
+
+ipcMainProxy.on('dialog/error', (event, args) => {
+  window.getWindow(args.dialog)?.webContents.send('dialog/error', args);
+});
+
+ipcMainProxy.on('dialog/close', (_event, args) => {
+  window.getWindow(args.dialog)?.webContents.send('dialog/close', args);
+});
+
+ipcMainProxy.handle('versions/macOs', () => {
+  return getMacOsVersion();
+});
+
+ipcMainProxy.handle('host/isArm', () => {
+  return process.arch === 'arm64';
+});
+
+ipcMainProxy.on('help/preferences/open-url', async() => {
+  Help.preferences.openUrl(await getVersion());
+});
+
+ipcMainProxy.handle('show-message-box', (_event, options: Electron.MessageBoxOptions): Promise<Electron.MessageBoxReturnValue> => {
+  return window.showMessageBox(options, false);
+});
+
+ipcMainProxy.handle('show-message-box-rd', async(_event, options: Electron.MessageBoxOptions, modal = false) => {
   const mainWindow = modal ? window.getWindow('main') : null;
 
   const dialog = window.openDialog(
@@ -726,10 +1021,147 @@ Electron.ipcMain.handle('show-message-box-rd', async(_event, options: Electron.M
   return response;
 });
 
+ipcMainProxy.handle('show-snapshots-confirm-dialog', async(
+  event,
+  options: { window: Partial<Electron.MessageBoxOptions>, format: SnapshotDialog },
+) => {
+  const mainWindow = window.getWindow('main');
+
+  const dialog = window.openDialog(
+    'SnapshotsDialog',
+    {
+      title:   'Snapshots',
+      modal:   true,
+      parent:  mainWindow || undefined,
+      frame:   true,
+      movable: true,
+      height:  365,
+      width:   640,
+    });
+
+  if (os.platform() !== 'linux' && mainWindow && dialog) {
+    window.centerDialog(mainWindow, dialog, 0, 50);
+  }
+
+  let response: any;
+
+  dialog.webContents.on('ipc-message', (_event, channel, args) => {
+    if (channel === 'dialog/mounted') {
+      options.format.type = 'question';
+      dialog.webContents.send('dialog/options', options);
+    }
+
+    if (channel === 'dialog/close') {
+      response = args || { response: options.window.cancelId };
+      dialog.close();
+    }
+  });
+
+  dialog.on('close', () => {
+    if (response) {
+      return;
+    }
+
+    response = { response: options.window.cancelId };
+  });
+
+  await (new Promise<void>((resolve) => {
+    dialog.on('closed', resolve);
+  }));
+
+  return response;
+});
+
+ipcMainProxy.handle('show-snapshots-blocking-dialog', async(
+  event,
+  options: { window: Partial<Electron.MessageBoxOptions>, format: SnapshotDialog },
+) => {
+  const dialogId = 'SnapshotsDialog';
+
+  if (window.getWindow(dialogId)) {
+    return;
+  }
+
+  const mainWindow = window.getWindow('main');
+
+  const dialog = window.openDialog(
+    dialogId,
+    {
+      modal:   true,
+      parent:  mainWindow || undefined,
+      frame:   false,
+      movable: false,
+      height:  500,
+      width:   700,
+    },
+    false);
+
+  const onMainWindowMove = () => {
+    if (mainWindow && dialog) {
+      window.centerDialog(mainWindow, dialog);
+    }
+  };
+
+  if (mainWindow && dialog) {
+    if (os.platform() === 'linux') {
+      /** Lock dialog position */
+      mainWindow.on('move', onMainWindowMove);
+    } else {
+      /** Center the dialog on main window, only for MacOs, Windows */
+      window.centerDialog(mainWindow, dialog, 0, 50);
+    }
+  }
+
+  let response: any;
+
+  dialog.webContents.on('ipc-message', (_event, channel, args) => {
+    if (channel === 'dialog/mounted') {
+      if (os.platform() !== 'darwin') {
+        mainWindow?.webContents.send('window/blur', true);
+      }
+
+      options.format.type = 'operation';
+      dialog.webContents.send('dialog/options', options);
+      event.sender.sendToFrame(event.frameId, 'dialog/mounted');
+    }
+
+    if (channel === 'dialog/close') {
+      response = args || { response: options.window.cancelId };
+      dialog.close();
+    }
+  });
+
+  dialog.on('close', () => {
+    if (os.platform() !== 'darwin') {
+      mainWindow?.webContents.send('window/blur', false);
+    }
+
+    if (os.platform() === 'linux' && mainWindow) {
+      mainWindow.off('move', onMainWindowMove);
+    }
+
+    if (response) {
+      return;
+    }
+
+    response = { response: options.window.cancelId };
+  });
+
+  await (new Promise<void>((resolve) => {
+    dialog.on('closed', resolve);
+  }));
+
+  return response;
+});
+
 function showErrorDialog(title: string, message: string, fatal?: boolean) {
-  Electron.dialog.showErrorBox(title, message);
+  if (noModalDialogs) {
+    console.log(`Fatal Error:\n${ title }\n\n${ message }`);
+  } else {
+    Electron.dialog.showErrorBox(title, message);
+  }
   if (fatal) {
-    process.exit(0);
+    Electron.app.quit();
   }
 }
 
@@ -740,6 +1172,18 @@ async function handleFailure(payload: any) {
 
   if (payload instanceof K8s.KubernetesError) {
     ({ name: titlePart, message } = payload);
+  } else if (payload instanceof LockedFieldError) {
+    showErrorDialog(titlePart, payload.message, true);
+
+    return;
+  } else if (payload instanceof DeploymentProfileError) {
+    showErrorDialog('Failed to load the deployment profile', payload.message, true);
+
+    return;
+  } else if (payload instanceof FatalCommandLineOptionError) {
+    showErrorDialog('Error in command-line options', payload.message, true);
+
+    return;
   } else if (payload instanceof Error) {
     secondaryMessage = payload.toString();
   } else if (typeof payload === 'number') {
@@ -759,7 +1203,9 @@ async function handleFailure(payload: any) {
       if (noModalDialogs) {
         console.log(titlePart);
         console.log(secondaryMessage || message);
-        console.log(failureDetails);
+        // Since the log is to a file, we need to pretty-print it; otherwise the
+        // message will just be `[Object object]`.
+        console.log(JSON.stringify(failureDetails, undefined, 2));
         gone = true;
         Electron.app.quit();
       } else {
@@ -787,31 +1233,41 @@ function doFullRestart(context: CommandWorkerInterface.CommandContext) {
   });
 }
 
+async function getExtensionManager() {
+  const getEM = (await import('@pkg/main/extensions/manager')).default;
+
+  return await getEM();
+}
+
 function newK8sManager() {
-  const arch = (Electron.app.runningUnderARM64Translation || os.arch() === 'arm64') ? 'aarch64' : 'x86_64';
+  const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
   const mgr = K8sFactory(arch, dockerDirManager);
 
-  mgr.on('state-changed', (state: K8s.State) => {
-    mainEvents.emit('k8s-check-state', mgr);
-    window.send('k8s-check-state', state);
-    if ([K8s.State.STARTED, K8s.State.DISABLED].includes(state)) {
-      if (!cfg.kubernetes.version) {
-        writeSettings({ kubernetes: { version: mgr.kubeBackend.version } });
-      }
-      currentImageProcessor?.relayNamespaces();
+  mgr.on('state-changed', async(state: K8s.State) => {
+    try {
+      mainEvents.emit('k8s-check-state', mgr);
+      window.send('k8s-check-state', state);
+      if ([K8s.State.STARTED, K8s.State.DISABLED].includes(state)) {
+        if (!cfg.kubernetes.version) {
+          writeSettings({ kubernetes: { version: mgr.kubeBackend.version } });
+        }
+        currentImageProcessor?.relayNamespaces();
 
-      if (enabledK8s) {
-        Steve.getInstance().start();
+        if (enabledK8s) {
+          await Steve.getInstance().start();
+        }
       }
-    }
 
-    if (state === K8s.State.STOPPING) {
-      Steve.getInstance().stop();
-    }
-    if (pendingRestartContext !== undefined && !backendIsBusy()) {
-      // If we restart immediately the QEMU process in the VM doesn't always respond to a shutdown messages
-      setTimeout(doFullRestart, 2_000, pendingRestartContext);
-      pendingRestartContext = undefined;
+      if (state === K8s.State.STOPPING) {
+        Steve.getInstance().stop();
+      }
+      if (pendingRestartContext !== undefined && !backendIsBusy()) {
+        // If we restart immediately the QEMU process in the VM doesn't always respond to a shutdown messages
+        setTimeout(doFullRestart, 2_000, pendingRestartContext);
+        pendingRestartContext = undefined;
+      }
+    } catch (ex) {
+      console.error(ex);
     }
   });
 
@@ -827,10 +1283,6 @@ function newK8sManager() {
     window.send('k8s-current-port', port);
   });
 
-  mgr.kubeBackend.on('kim-builder-uninstalled', () => {
-    writeSettings({ kubernetes: { checkForExistingKimBuilder: false } });
-  });
-
   mgr.kubeBackend.on('service-changed', (services: K8s.ServiceEntry[]) => {
     console.debug(`service-changed: ${ JSON.stringify(services) }`);
     window.send('service-changed', services);
@@ -842,10 +1294,26 @@ function newK8sManager() {
   });
 
   mgr.kubeBackend.on('versions-updated', async() => {
-    window.send('k8s-versions', await mgr.kubeBackend.availableVersions, await mgr.kubeBackend.cachedVersionsOnly());
+    const versions = await mgr.kubeBackend.availableVersions;
+    const cachedOnly = await mgr.kubeBackend.cachedVersionsOnly();
+
+    window.send('k8s-versions', versions.map(v => v.versionEntry), cachedOnly);
   });
 
   return mgr;
+}
+
+function validateEarlySettings(cfg: settings.Settings, newSettings: RecursivePartial<settings.Settings>, lockedFields: settings.LockedSettingsType): void {
+  // RD hasn't loaded the supported k8s versions yet, so have it defer actually checking the specified version.
+  // If it can't find this version, it will silently move to the closest version.
+  // We'd have to add more code to report that.
+  // It isn't worth adding that code yet. It might never be needed.
+  const newSettingsForValidation = _.omit(newSettings, 'kubernetes.version');
+  const [, errors] = new SettingsValidator().validateSettings(cfg, newSettingsForValidation, lockedFields);
+
+  if (errors.length > 0) {
+    throw new LockedFieldError(`Error in deployment profiles:\n${ errors.join('\n') }`);
+  }
 }
 
 /**
@@ -858,24 +1326,47 @@ function newK8sManager() {
  * The `requestShutdown` method is a special case that never returns.
  */
 class BackgroundCommandWorker implements CommandWorkerInterface {
-  protected k8sVersions: string[] = [];
   protected settingsValidator = new SettingsValidator();
 
   /**
    * Use the settings validator to validate settings after doing any
    * initialization.
    */
-  protected async validateSettings(...args: Parameters<SettingsValidator['validateSettings']>) {
-    if (this.k8sVersions.length === 0) {
-      this.k8sVersions = (await k8smanager.kubeBackend.availableVersions).map(entry => entry.version.version);
-      this.settingsValidator.k8sVersions = this.k8sVersions;
+  protected async validateSettings(existingSettings: settings.Settings, newSettings: RecursivePartial<settings.Settings>) {
+    let clearVersionsAfterTesting = false;
+
+    if (newSettings.kubernetes?.version && this.settingsValidator.k8sVersions.length === 0) {
+      // If we're starting up (by running `rdctl start...`) we probably haven't loaded all the k8s versions yet.
+      // We don't want to verify if the proposed version makes sense (if it doesn't, we'll assign the default version later).
+      // Here we just want to make sure that if we're changing the version to a different value from the current one,
+      // the field isn't locked.
+      let currentK8sVersions = (await k8smanager.kubeBackend.availableVersions).map(entry => entry.version.version);
+
+      if (currentK8sVersions.length === 0) {
+        clearVersionsAfterTesting = true;
+        currentK8sVersions = [newSettings.kubernetes.version];
+        if (existingSettings.kubernetes.version) {
+          currentK8sVersions.push(existingSettings.kubernetes.version);
+        }
+      }
+      this.settingsValidator.k8sVersions = currentK8sVersions;
     }
 
-    return this.settingsValidator.validateSettings(...args);
+    const result = this.settingsValidator.validateSettings(existingSettings, newSettings, settingsImpl.getLockedSettings());
+
+    if (clearVersionsAfterTesting) {
+      this.settingsValidator.k8sVersions = [];
+    }
+
+    return result;
   }
 
   getSettings() {
     return jsonStringifyWithWhiteSpace(cfg);
+  }
+
+  getLockedSettings() {
+    return jsonStringifyWithWhiteSpace(settingsImpl.getLockedSettings());
   }
 
   getDiagnosticCategories(): string[]|undefined {
@@ -898,18 +1389,56 @@ class BackgroundCommandWorker implements CommandWorkerInterface {
     doFactoryReset(keepSystemImages);
   }
 
+  async forwardPort(namespace: string, service: string, k8sPort: string | number, hostPort: number) {
+    return await doForwardPort(namespace, service, k8sPort, hostPort);
+  }
+
+  async cancelForward(namespace: string, service: string, k8sPort: string | number) {
+    return await doCancelForward(namespace, service, k8sPort);
+  }
+
+  /**
+   * Execute the preference update for services that don't require a backend restart.
+   */
+  async handleSettingsUpdate(newConfig: settings.Settings): Promise<void> {
+    const allowedImagesConf = '/usr/local/openresty/nginx/conf/allowed-images.conf';
+    const rcService = k8smanager.backend === 'wsl' ? 'wsl-service' : 'rc-service';
+
+    // Update image allow list patterns, just in case the backend doesn't need restarting
+    // TODO: review why this block is needed at all
+    if (cfg.containerEngine.allowedImages.enabled) {
+      const allowListConf = BackendHelper.createAllowedImageListConf(cfg.containerEngine.allowedImages);
+
+      await k8smanager.executor.writeFile(allowedImagesConf, allowListConf, 0o644);
+      await k8smanager.executor.execCommand({ root: true }, rcService, '--ifstarted', 'rd-openresty', 'reload');
+    } else {
+      await k8smanager.executor.execCommand({ root: true }, rcService, '--ifstarted', 'rd-openresty', 'stop');
+      await k8smanager.executor.execCommand({ root: true }, 'rm', '-f', allowedImagesConf);
+    }
+
+    await k8smanager.handleSettingsUpdate(newConfig);
+  }
+
   /**
    * Check semantics of SET commands:
    * - verify that setting names are recognized, and validate provided values
    * - returns an array of two strings:
    *   1. a description of the status of the request, if it was valid
    *   2. a list of any errors in the request body.
-   * @param newSettings: a subset of the Settings object, containing the desired values
+   * @param specifiedNewSettings: a subset of the Settings object, containing the desired values
    * @returns [{string} description of final state if no error, {string} error message]
    */
-  async updateSettings(context: CommandWorkerInterface.CommandContext, newSettings: RecursivePartial<settings.Settings>): Promise<[string, string]> {
-    const [needToUpdate, errors] = await this.validateSettings(cfg, newSettings);
+  async updateSettings(context: CommandWorkerInterface.CommandContext, specifiedNewSettings: RecursivePartial<settings.Settings>): Promise<[string, string]> {
+    let errors: string[] = [];
+    let needToUpdate = false;
+    let newSettings: RecursivePartial<settings.Settings> = {};
 
+    try {
+      newSettings = settingsImpl.migrateSpecifiedSettingsToCurrentVersion(specifiedNewSettings, false);
+      [needToUpdate, errors] = await this.validateSettings(cfg, newSettings);
+    } catch (ex: any) {
+      errors.push(ex.message);
+    }
     if (errors.length > 0) {
       return ['', `errors in attempt to update settings:\n${ errors.join('\n') }`];
     }
@@ -917,17 +1446,14 @@ class BackgroundCommandWorker implements CommandWorkerInterface {
       writeSettings(newSettings);
       // cfg is a global, and at this point newConfig has been merged into it :(
       window.send('settings-update', cfg);
+      window.send('preferences/changed');
     } else {
       // Obviously if there are no settings to update, there's no need to restart.
       return ['no changes necessary', ''];
     }
 
-    // Update image allow list patterns, just in case the backend doesn't need restarting
-    const allowListConf = BackendHelper.createImageAllowListConf(cfg.containerEngine.imageAllowList);
-    const rcService = k8smanager.backend === 'wsl' ? 'wsl-service' : 'rc-service';
-
-    await k8smanager.executor.writeFile(`/usr/local/openresty/nginx/conf/image-allow-list.conf`, allowListConf, 0o644);
-    await k8smanager.executor.execCommand({ root: true }, rcService, '--ifstarted', 'openresty', 'reload');
+    // Update the values that doesn't need a restart of the backend.
+    await this.handleSettingsUpdate(cfg);
 
     // Check if the newly applied preferences demands a restart of the backend.
     const restartReasons = await k8smanager.requiresRestartReasons(cfg);
@@ -978,7 +1504,7 @@ class BackgroundCommandWorker implements CommandWorkerInterface {
   ): Promise<[string, string]> {
     const [needToUpdate, errors] = this.settingsValidator.validateTransientSettings(TransientSettings.value, newTransientSettings);
 
-    return Promise.resolve((() => {
+    return Promise.resolve(((): [string, string] => {
       if (errors.length > 0) {
         return ['', `errors in attempt to update Transient Settings:\n${ errors.join('\n') }`];
       }
@@ -990,6 +1516,131 @@ class BackgroundCommandWorker implements CommandWorkerInterface {
 
       return ['No changes necessary', ''];
     })());
+  }
+
+  async listExtensions() {
+    const extensionManager = await getExtensionManager();
+
+    if (!extensionManager) {
+      return undefined;
+    }
+    const extensions = await extensionManager.getInstalledExtensions();
+    const entries = await Promise.all(extensions.map(async x => [x.id, {
+      version:  x.version,
+      metadata: await x.metadata,
+      labels:   await x.labels,
+    }] as const));
+
+    return Object.fromEntries(entries);
+  }
+
+  async installExtension(image: string, state: 'install' | 'uninstall'): Promise<{status: number, data?: any}> {
+    const em = await getExtensionManager();
+
+    if (!em) {
+      return { status: 503, data: 'Extension manager is not ready yet.' };
+    }
+    const extension = await em.getExtension(image, { preferInstalled: state === 'uninstall' });
+
+    if (state === 'install') {
+      console.debug(`Installing extension ${ image }...`);
+      try {
+        const { enabled, list } = cfg.application.extensions.allowed;
+
+        if (await extension.install(enabled ? list : undefined)) {
+          return { status: 201 };
+        } else {
+          return { status: 204 };
+        }
+      } catch (ex: any) {
+        if (isExtensionError(ex)) {
+          switch (ex.code) {
+          case ExtensionErrorCode.INVALID_METADATA:
+            return { status: 422, data: `The image ${ image } has invalid extension metadata` };
+          case ExtensionErrorCode.FILE_NOT_FOUND:
+            return { status: 422, data: `The image ${ image } failed to install: ${ ex.message }` };
+          case ExtensionErrorCode.INSTALL_DENIED:
+            return { status: 403, data: `The image ${ image } is not an allowed extension` };
+          }
+        }
+        throw ex;
+      } finally {
+        window.send('extensions/changed');
+      }
+    } else {
+      console.debug(`Uninstalling extension ${ image }...`);
+      try {
+        if (await extension.uninstall()) {
+          window.send('ok:extensions/uninstall', image);
+
+          return { status: 201 };
+        } else {
+          return { status: 204 };
+        }
+      } catch (ex: any) {
+        if (isExtensionError(ex)) {
+          switch (ex.code) {
+          case ExtensionErrorCode.INVALID_METADATA:
+            return { status: 422, data: `The image ${ image } has invalid extension metadata` };
+          }
+        }
+        throw ex;
+      } finally {
+        window.send('extensions/changed');
+      }
+    }
+  }
+
+  async getBackendState(): Promise<BackendState> {
+    const backendIsLocked = await readBackendLockFile();
+
+    return {
+      vmState: k8smanager.state,
+      locked:  !!backendIsLocked,
+    };
+  }
+
+  async setBackendState(state: BackendState): Promise<void> {
+    await doesBackendLockExist();
+    switch (state.vmState) {
+    case State.STARTED:
+      cfg = settingsImpl.load(deploymentProfiles);
+      mainEvents.emit('settings-update', cfg);
+
+      setImmediate(() => {
+        startBackend();
+      });
+
+      return;
+    case State.STOPPED:
+      setImmediate(() => {
+        k8smanager.stop();
+      });
+
+      return;
+    default:
+      throw new Error(`invalid desired VM state "${ state.vmState }"`);
+    }
+  }
+
+  async listSnapshots(context: CommandWorkerInterface.CommandContext) {
+    return await Snapshots.list();
+  }
+
+  async createSnapshot(context: CommandWorkerInterface.CommandContext, snapshot: Snapshot) {
+    return await Snapshots.create(snapshot);
+  }
+
+  async restoreSnapshot(context: CommandWorkerInterface.CommandContext, name: string) {
+    return await Snapshots.restore(name);
+  }
+
+  async cancelSnapshot() {
+    return await Snapshots.cancel();
+  }
+
+  async deleteSnapshot(context: CommandWorkerInterface.CommandContext, name: string) {
+    return await Snapshots.delete(name);
   }
 }
 
@@ -1004,4 +1655,16 @@ function isRoot(): boolean {
   }
 
   return os.userInfo().uid === 0;
+}
+
+async function runRdctlSetup(newSettings: settings.Settings): Promise<void> {
+  // don't do anything with auto-start configuration if running in development
+  if (isDevEnv) {
+    return;
+  }
+
+  const rdctlPath = executable('rdctl');
+  const args = ['setup', `--auto-start=${ newSettings.application.autoStart }`];
+
+  await spawnFile(rdctlPath, args);
 }

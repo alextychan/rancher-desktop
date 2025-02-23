@@ -4,52 +4,27 @@ import path from 'path';
 
 import { test, expect } from '@playwright/test';
 import _ from 'lodash';
-import { ElectronApplication, BrowserContext, _electron, Page } from 'playwright';
 import semver from 'semver';
 
 import { NavPage } from './pages/nav-page';
-import { createDefaultSettings, packageLogs, reportAsset } from './utils/TestUtils';
+import { getAlternateSetting, startSlowerDesktop, teardown } from './utils/TestUtils';
 
 import { Settings, ContainerEngine } from '@pkg/config/settings';
 import fetch from '@pkg/utils/fetch';
 import paths from '@pkg/utils/paths';
-import { RecursivePartial, RecursiveKeys, RecursiveTypes } from '@pkg/utils/typeUtils';
+import { RecursivePartial, RecursiveKeys } from '@pkg/utils/typeUtils';
 
-import type { GetFieldType } from 'lodash';
+import type { ElectronApplication, Page } from '@playwright/test';
 
 test.describe.serial('KubernetesBackend', () => {
   let electronApp: ElectronApplication;
-  let context: BrowserContext;
   let page: Page;
 
-  test.beforeAll(async() => {
-    createDefaultSettings();
-
-    electronApp = await _electron.launch({
-      args: [
-        path.join(__dirname, '../'),
-        '--disable-gpu',
-        '--whitelisted-ips=',
-        // See pkg/rancher-desktop/utils/commandLine.ts before changing the next item as the final option.
-        '--disable-dev-shm-usage',
-        '--no-modal-dialogs',
-      ],
-      env: {
-        ...process.env,
-        RD_LOGS_DIR: reportAsset(__filename, 'log'),
-      },
-    });
-    context = electronApp.context();
-
-    await context.tracing.start({ screenshots: true, snapshots: true });
-    page = await electronApp.firstWindow();
+  test.beforeAll(async({ colorScheme }, testInfo) => {
+    [electronApp, page] = await startSlowerDesktop(testInfo);
   });
 
-  test.afterAll(async() => {
-    await context.tracing.stop({ path: reportAsset(__filename) });
-    await packageLogs(__filename);
-    await electronApp.close();
-  });
+  test.afterAll(({ colorScheme }, testInfo) => teardown(electronApp, testInfo));
 
   test('should start loading the background services and hide progress bar', async() => {
     const navPage = new NavPage(page);
@@ -109,41 +84,46 @@ test.describe.serial('KubernetesBackend', () => {
     }
 
     test('should detect changes', async() => {
-      const currentSettings = (await get('/v0/settings')) as Settings;
-      /**
-       * getAlt returns the setting that isn't the same as the existing setting.
-       */
-      const getAlt = <K extends keyof RecursiveTypes<Settings>>(setting: K, altOne: GetFieldType<Settings, K>, altTwo: GetFieldType<Settings, K>) => {
-        return _.get(currentSettings, setting) === altOne ? altTwo : altOne;
-      };
+      const currentSettings = (await get('/v1/settings')) as Settings;
+
+      if (!currentSettings.kubernetes.version) {
+        // The Kubernetes version could be empty if it's previously disabled.
+        // Set something.
+        const updatedSettings: RecursivePartial<Settings> = {
+          kubernetes: { version: '1.23.4' },
+          version:    10 as Settings['version'],
+        };
+
+        await expect(put('/v1/settings', updatedSettings)).resolves.toBeDefined();
+      }
 
       const newSettings: RecursivePartial<Settings> = {
-        kubernetes: {
-          version:         getAlt('kubernetes.version', '1.23.6', '1.23.5'),
-          port:            getAlt('kubernetes.port', 6443, 6444),
-          containerEngine: getAlt('kubernetes.containerEngine', ContainerEngine.CONTAINERD, ContainerEngine.MOBY),
-          enabled:         getAlt('kubernetes.enabled', true, false),
-          options:         {
-            traefik: getAlt('kubernetes.options.traefik', true, false),
-            flannel: getAlt('kubernetes.options.flannel', true, false),
+        containerEngine: { name: getAlternateSetting(currentSettings, 'containerEngine.name', ContainerEngine.CONTAINERD, ContainerEngine.MOBY) },
+        kubernetes:      {
+          version: getAlternateSetting(currentSettings, 'kubernetes.version', '1.23.6', '1.23.5'),
+          port:    getAlternateSetting(currentSettings, 'kubernetes.port', 6443, 6444),
+          enabled: getAlternateSetting(currentSettings, 'kubernetes.enabled', true, false),
+          options: {
+            traefik: getAlternateSetting(currentSettings, 'kubernetes.options.traefik', true, false),
+            flannel: getAlternateSetting(currentSettings, 'kubernetes.options.flannel', true, false),
           },
         },
       };
       /** Platform-specific changes to `newSettings`. */
       const platformSettings: Partial<Record<NodeJS.Platform, RecursivePartial<Settings>>> = {
-        win32:  { kubernetes: { hostResolver: getAlt('kubernetes.hostResolver', true, false) } },
-        darwin: { kubernetes: { experimental: { socketVMNet: getAlt('kubernetes.experimental.socketVMNet', true, false) } } },
+        win32:  { kubernetes: { ingress: { localhostOnly: getAlternateSetting(currentSettings, 'kubernetes.ingress.localhostOnly', true, false) } } },
+        darwin: { experimental: { virtualMachine: { useRosetta: getAlternateSetting(currentSettings, 'experimental.virtualMachine.useRosetta', true, false) } } },
       };
 
       _.merge(newSettings, platformSettings[process.platform] ?? {});
       if (['darwin', 'linux'].includes(process.platform)) {
         // Lima-specific changes to `newSettings`.
         _.merge(newSettings, {
-          kubernetes: {
-            numberCPUs:   getAlt('kubernetes.numberCPUs', 1, 2),
-            memoryInGB:   getAlt('kubernetes.memoryInGB', 3, 4),
-            suppressSudo: getAlt('kubernetes.suppressSudo', true, false),
+          virtualMachine: {
+            numberCPUs: getAlternateSetting(currentSettings, 'virtualMachine.numberCPUs', 1, 2),
+            memoryInGB: getAlternateSetting(currentSettings, 'virtualMachine.memoryInGB', 3, 4),
           },
+          application: { adminAccess: getAlternateSetting(currentSettings, 'application.adminAccess', false, true) },
         });
       }
 
@@ -156,7 +136,7 @@ test.describe.serial('KubernetesBackend', () => {
       const expectedDefinition: ExpectedDefinition = {
         'kubernetes.version':         semver.lt(newSettings.kubernetes?.version ?? '0.0.0', currentSettings.kubernetes.version),
         'kubernetes.port':            false,
-        'kubernetes.containerEngine': false,
+        'containerEngine.name':       false,
         'kubernetes.enabled':         false,
         'kubernetes.options.traefik': false,
         'kubernetes.options.flannel': false,
@@ -164,17 +144,17 @@ test.describe.serial('KubernetesBackend', () => {
 
       /** Platform-specific additions to `expectedDefinition`. */
       const platformExpectedDefinitions: Partial<Record<NodeJS.Platform, ExpectedDefinition>> = {
-        win32:  { 'kubernetes.hostResolver': false },
-        darwin: { 'kubernetes.experimental.socketVMNet': false },
+        win32:  { 'kubernetes.ingress.localhostOnly': false },
+        darwin: { 'experimental.virtualMachine.useRosetta': false },
       };
 
       _.merge(expectedDefinition, platformExpectedDefinitions[process.platform] ?? {});
 
       if (['darwin', 'linux'].includes(process.platform)) {
         // Lima additions to expectedDefinition
-        expectedDefinition['kubernetes.suppressSudo'] = false;
-        expectedDefinition['kubernetes.numberCPUs'] = false;
-        expectedDefinition['kubernetes.memoryInGB'] = false;
+        expectedDefinition['application.adminAccess'] = false;
+        expectedDefinition['virtualMachine.numberCPUs'] = false;
+        expectedDefinition['virtualMachine.memoryInGB'] = false;
       }
 
       const expected: Record<string, {current: any, desired: any, severity: 'reset' | 'restart'}> = {};
@@ -189,25 +169,25 @@ test.describe.serial('KubernetesBackend', () => {
         expected[key] = entry;
       }
 
-      await expect(put('/v0/propose_settings', newSettings)).resolves.toEqual(expected);
+      await expect(put('/v1/propose_settings', newSettings)).resolves.toEqual(expected);
     });
 
     test('should handle WSL integrations', async() => {
       test.skip(os.platform() !== 'win32', 'WSL integration only supported on Windows');
       const random = `${ Date.now() }${ Math.random() }`;
       const newSettings: RecursivePartial<Settings> = {
-        kubernetes: {
-          WSLIntegrations: {
+        WSL: {
+          integrations: {
             [`true-${ random }`]:  true,
             [`false-${ random }`]: false,
           },
         },
       };
 
-      await expect(put('/v0/propose_settings', newSettings)).resolves.toMatchObject({
-        'kubernetes.WSLIntegrations': {
-          current: {},
-          desired: newSettings.kubernetes?.WSLIntegrations,
+      await expect(put('/v1/propose_settings', newSettings)).resolves.toMatchObject({
+        'WSL.integrations': {
+          desired:  newSettings.WSL?.integrations,
+          severity: 'restart',
         },
       });
     });

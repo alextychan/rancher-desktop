@@ -13,9 +13,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package cmd
 
 import (
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
@@ -53,6 +55,8 @@ func init() {
 	dockerproxyServeCmd.Flags().String("endpoint", platform.DefaultEndpoint, "Endpoint to listen on")
 	dockerproxyServeCmd.Flags().Uint32("port", dockerproxy.DefaultPort, "Vsock port docker is listening on")
 	dockerproxyServeViper.AutomaticEnv()
-	dockerproxyServeViper.BindPFlags(dockerproxyServeCmd.Flags())
+	if err := dockerproxyServeViper.BindPFlags(dockerproxyServeCmd.Flags()); err != nil {
+		logrus.WithError(err).Fatal("Failed to set up flags")
+	}
 	dockerproxyCmd.AddCommand(dockerproxyServeCmd)
 }

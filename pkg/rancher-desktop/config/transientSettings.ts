@@ -18,8 +18,10 @@ export const defaultTransientSettings = {
     navItem: {
       current:     'Application' as NavItemName,
       currentTabs: {
-        Application:        'behavior',
+        Application:        'general',
+        'Virtual Machine':  'hardware',
         'Container Engine': 'general',
+        ...(process.platform === 'win32' && { WSL: 'integration' }),
       } as Record<NavItemName, string | undefined>,
     },
   },

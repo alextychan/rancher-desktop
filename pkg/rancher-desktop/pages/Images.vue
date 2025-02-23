@@ -10,6 +10,7 @@
       :show-all="settings.images.showAll"
       :selected-namespace="settings.images.namespace"
       :supports-namespaces="supportsNamespaces"
+      :protected-images="protectedImages"
       @toggledShowAll="onShowAllImagesChanged"
       @switchNamespace="onChangeNamespace"
     />
@@ -17,6 +18,7 @@
 </template>
 
 <script>
+
 import _ from 'lodash';
 import { mapGetters } from 'vuex';
 
@@ -24,6 +26,11 @@ import { State as K8sState } from '@pkg/backend/backend';
 import Images from '@pkg/components/Images.vue';
 import { defaultSettings } from '@pkg/config/settings';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
+
+const ImageMangerStates = Object.freeze({
+  UNREADY: 'IMAGE_MANAGER_UNREADY',
+  READY:   'READY',
+});
 
 export default {
   components: { Images },
@@ -39,30 +46,47 @@ export default {
   computed: {
     state() {
       if (![K8sState.STARTED, K8sState.DISABLED].includes(this.k8sState)) {
-        return 'IMAGE_MANAGER_UNREADY';
+        return ImageMangerStates.UNREADY;
       }
 
-      return this.imageManagerState ? 'READY' : 'IMAGE_MANAGER_UNREADY';
+      return this.imageManagerState ? ImageMangerStates.READY : ImageMangerStates.UNREADY;
+    },
+    rancherImages() {
+      return this.images
+        .filter(image => image.imageName.startsWith('rancher/'))
+        .map(image => image.imageName);
+    },
+    installedExtensionImages() {
+      return this.extensions.map(image => image.id);
+    },
+    protectedImages() {
+      return [
+        'moby/buildkit',
+        'ghcr.io/rancher-sandbox/rancher-desktop/rdx-proxy',
+        ...this.rancherImages,
+        ...this.installedExtensionImages,
+      ];
     },
     ...mapGetters('k8sManager', { k8sState: 'getK8sState' }),
     ...mapGetters('imageManager', { imageManagerState: 'getImageManagerState' }),
+    ...mapGetters('extensions', { extensions: 'list' }),
   },
 
   watch: {
-    imageManagerState: {
+    state: {
       handler(state) {
         this.$store.dispatch(
           'page/setHeader',
           { title: this.t('images.title') },
         );
 
-        if (!state) {
+        if (!state || state === ImageMangerStates.UNREADY) {
           return;
         }
 
         this.$store.dispatch(
           'page/setAction',
-          { action: 'images-button-add' },
+          { action: 'ImagesButtonAdd' },
         );
       },
       immediate: true,
@@ -114,11 +138,15 @@ export default {
       this.$data.settings = settings;
     });
     ipcRenderer.send('settings-read');
+
+    ipcRenderer.on('extensions/changed', this.fetchExtensions);
+    this.$store.dispatch('extensions/fetch');
   },
   beforeDestroy() {
     ipcRenderer.invoke('images-mounted', false);
     ipcRenderer.removeAllListeners('images-mounted');
     ipcRenderer.removeAllListeners('images-changed');
+    ipcRenderer.removeListener('extensions/changed', this.fetchExtensions);
   },
 
   methods: {
@@ -128,8 +156,7 @@ export default {
         return;
       }
       if (!this.imageNamespaces.includes(this.settings.images.namespace)) {
-        const K8S_NAMESPACE = 'k8s.io';
-        const defaultNamespace = this.imageNamespaces.includes(K8S_NAMESPACE) ? K8S_NAMESPACE : this.imageNamespaces[0];
+        const defaultNamespace = this.imageNamespaces.includes('default') ? 'default' : this.imageNamespaces[0];
 
         ipcRenderer.invoke('settings-write',
           { images: { namespace: defaultNamespace } } );
@@ -146,6 +173,9 @@ export default {
         ipcRenderer.invoke('settings-write',
           { images: { namespace: value } } );
       }
+    },
+    fetchExtensions() {
+      this.$store.dispatch('extensions/fetch');
     },
   },
 };

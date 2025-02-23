@@ -2,62 +2,103 @@
 import os from 'os';
 
 import Vue from 'vue';
+import { mapGetters, mapState } from 'vuex';
 
-import SystemPreferences from '@pkg/components/SystemPreferences.vue';
-import { defaultSettings, Settings } from '@pkg/config/settings';
-import { RecursiveTypes } from '@pkg/utils/typeUtils';
+import PreferencesVirtualMachineEmulation from '@pkg/components/Preferences/VirtualMachineEmulation.vue';
+import PreferencesVirtualMachineHardware from '@pkg/components/Preferences/VirtualMachineHardware.vue';
+import PreferencesVirtualMachineVolumes from '@pkg/components/Preferences/VirtualMachineVolumes.vue';
+import RdTabbed from '@pkg/components/Tabbed/RdTabbed.vue';
+import Tab from '@pkg/components/Tabbed/Tab.vue';
+import { Settings } from '@pkg/config/settings';
+import type { ServerState } from '@pkg/main/commandServer/httpCommandServer';
 
 import type { PropType } from 'vue';
 
 export default Vue.extend({
   name:       'preferences-body-virtual-machine',
-  components: { SystemPreferences },
-  props:      {
+  components: {
+    RdTabbed,
+    Tab,
+    PreferencesVirtualMachineHardware,
+    PreferencesVirtualMachineVolumes,
+    PreferencesVirtualMachineEmulation,
+  },
+  props: {
     preferences: {
       type:     Object as PropType<Settings>,
       required: true,
     },
   },
-  data() {
-    return { settings: defaultSettings };
-  },
   computed: {
-    hasSystemPreferences(): boolean {
-      return !os.platform().startsWith('win');
+    ...mapGetters('preferences', ['isPlatformWindows']),
+    ...mapGetters('transientSettings', ['getActiveTab']),
+    ...mapState('credentials', ['credentials']),
+    activeTab(): string {
+      return this.getActiveTab || 'hardware';
     },
-    availMemoryInGB(): number {
-      return Math.ceil(os.totalmem() / 2 ** 30);
-    },
-    availNumCPUs(): number {
-      return os.cpus().length;
+    isPlatformDarwin(): boolean {
+      return os.platform() === 'darwin';
     },
   },
   methods: {
-    onChange<P extends keyof RecursiveTypes<Settings>>(property: P, value: RecursiveTypes<Settings>[P]) {
-      this.$store.dispatch('preferences/updatePreferencesData', { property, value });
+    async tabSelected({ tab }: { tab: Vue.Component }) {
+      if (this.activeTab !== tab.name) {
+        await this.navigate('Virtual Machine', tab.name || '');
+      }
+    },
+    async navigate(navItem: string, tab: string) {
+      await this.$store.dispatch(
+        'transientSettings/navigatePrefDialog',
+        {
+          ...this.credentials as ServerState,
+          navItem,
+          tab,
+        },
+      );
     },
   },
 });
 </script>
 
 <template>
-  <div class="preferences-content">
-    <system-preferences
-      v-if="hasSystemPreferences"
-      :memory-in-g-b="preferences.kubernetes.memoryInGB"
-      :number-c-p-us="preferences.kubernetes.numberCPUs"
-      :avail-memory-in-g-b="availMemoryInGB"
-      :avail-num-c-p-us="availNumCPUs"
-      :reserved-memory-in-g-b="6"
-      :reserved-num-c-p-us="1"
-      @update:memory="onChange('kubernetes.memoryInGB', $event)"
-      @update:cpu="onChange('kubernetes.numberCPUs', $event)"
-    />
-  </div>
+  <rd-tabbed
+    v-bind="$attrs"
+    class="action-tabs"
+    :no-content="true"
+    :default-tab="activeTab"
+    :active-tab="activeTab"
+    @changed="tabSelected"
+  >
+    <template #tabs>
+      <tab
+        v-if="isPlatformDarwin"
+        label="Emulation"
+        name="emulation"
+        :weight="1"
+      />
+      <tab
+        label="Volumes"
+        name="volumes"
+        :weight="3"
+      />
+      <tab
+        label="Hardware"
+        name="hardware"
+        :weight="4"
+      />
+    </template>
+    <div class="virtual-machine-content">
+      <component
+        :is="`preferences-virtual-machine-${ activeTab }`"
+        :preferences="preferences"
+        v-on="$listeners"
+      />
+    </div>
+  </rd-tabbed>
 </template>
 
 <style lang="scss" scoped>
-  .preferences-content {
+  .virtual-machine-content {
     padding: var(--preferences-content-padding);
   }
 </style>

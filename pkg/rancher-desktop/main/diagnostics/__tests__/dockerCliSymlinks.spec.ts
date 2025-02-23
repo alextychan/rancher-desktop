@@ -3,7 +3,7 @@ import os from 'os';
 import path from 'path';
 
 // The (mock) application directory.
-let appDir = '';
+let appDir = process.cwd();
 
 // Mock Electron.app.getAppPath() to return appDir.
 jest.mock('electron', () => {
@@ -18,16 +18,19 @@ jest.mock('electron', () => {
   };
 });
 
+// eslint-disable-next-line import/first -- Need to mock first
+import { CheckerDockerCLISymlink } from '../dockerCliSymlinks';
+
+// eslint-disable-next-line import/first -- Need to mock first
+import paths from '@pkg/utils/paths';
+
 // Mock fs.promises.readdir() for the default export.
 jest.spyOn(fs.promises, 'readdir').mockImplementation((dir, encoding) => {
-  expect(dir).toEqual(path.join(appDir, 'resources', os.platform(), 'bin'));
+  expect(dir).toEqual(path.join(appDir, 'resources', os.platform(), 'docker-cli-plugins'));
   expect(encoding).toEqual('utf-8');
 
   return Promise.resolve([]);
 });
-
-// eslint-disable-next-line import/first -- Need to mock first.
-import { CheckerDockerCLISymlink } from '../dockerCliSymlinks';
 
 const { mkdtemp, rm } = jest.requireActual('fs/promises');
 const describeUnix = process.platform === 'win32' ? describe.skip : describe;
@@ -39,13 +42,18 @@ describeUnix(CheckerDockerCLISymlink, () => {
   const rdBinDir = path.join(os.homedir(), '.rd', 'bin');
   const rdBinExecutable = path.join(rdBinDir, executable);
   let appDirExecutable = '';
+  let replacedPathsResources: jest.ReplaceProperty<string>;
 
   beforeAll(async() => {
     appDir = await mkdtemp(path.join(os.tmpdir(), 'rd-diag-'));
-    await fs.promises.mkdir(path.join(appDir, 'resources'));
-    appDirExecutable = path.join(appDir, 'resources', os.platform(), 'bin', executable);
+    const resourcesDir = path.join(appDir, 'resources');
+
+    await fs.promises.mkdir(resourcesDir);
+    appDirExecutable = path.join(resourcesDir, os.platform(), 'docker-cli-plugins', executable);
+    replacedPathsResources = jest.replaceProperty(paths, 'resources', resourcesDir);
   });
   afterAll(async() => {
+    replacedPathsResources.restore();
     await rm(appDir, { recursive: true, force: true });
   });
 
@@ -167,7 +175,7 @@ describeUnix(CheckerDockerCLISymlink, () => {
     expect(jest.spyOn(subject, 'access')).not.toHaveBeenCalled();
   });
 
-  it('should catch non-existent second symlink', async() => {
+  it('should catch nonexistent second symlink', async() => {
     const subject = new CheckerDockerCLISymlink(executable);
 
     jest.spyOn(subject, 'readlink')

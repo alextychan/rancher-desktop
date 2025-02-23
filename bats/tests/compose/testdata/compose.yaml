@@ -1,0 +1,16 @@
+services:
+  nginx:
+    container_name: nginx
+    image: nginx
+    volumes:
+    - ./nginx.conf:/etc/nginx/nginx.conf
+    ports:
+    - '127.0.0.1:8080:80'
+  web:
+    build:
+      context: app
+    # flask requires SIGINT to stop gracefully
+    # (default stop signal from Compose is SIGTERM)
+    stop_signal: SIGINT
+    ports:
+    - '8000:8000'

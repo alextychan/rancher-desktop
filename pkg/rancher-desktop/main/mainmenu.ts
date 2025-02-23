@@ -1,7 +1,7 @@
 import Electron, { Menu, MenuItem, MenuItemConstructorOptions, shell } from 'electron';
 
 import { getVersion, parseDocsVersion } from '@pkg/utils/version';
-import { openMain } from '@pkg/window';
+import { openPreferences } from '@pkg/window/preferences';
 
 const baseUrl = `https://docs.rancherdesktop.io`;
 
@@ -45,6 +45,43 @@ function getEditMenu(isMac: boolean): MenuItem {
       { role: 'delete', label: 'De&lete' },
       ...(!isMac ? [{ type: 'separator' } as MenuItemConstructorOptions] : []),
       { role: 'selectAll', label: 'Select &All' },
+    ],
+  });
+}
+
+function getViewMenu(): MenuItem {
+  return new MenuItem({
+    label:   '&View',
+    submenu: [
+      ...(Electron.app.isPackaged ? [] : [
+        { role: 'reload', label: '&Reload' },
+        { role: 'forceReload', label: '&Force Reload' },
+        { role: 'toggleDevTools', label: 'Toggle &Developer Tools' },
+        { type: 'separator' },
+      ] as const),
+      {
+        label:       '&Actual Size',
+        accelerator: 'CmdOrCtrl+0',
+        click(_item, focusedWindow) {
+          adjustZoomLevel(focusedWindow, 0);
+        },
+      },
+      {
+        label:       'Zoom &In',
+        accelerator: 'CmdOrCtrl+Plus',
+        click(_item, focusedWindow) {
+          adjustZoomLevel(focusedWindow, 0.5);
+        },
+      },
+      {
+        label:       'Zoom &Out',
+        accelerator: 'CmdOrCtrl+-',
+        click(_item, focusedWindow) {
+          adjustZoomLevel(focusedWindow, -0.5);
+        },
+      },
+      { type: 'separator' },
+      { role: 'togglefullscreen', label: 'Toggle Full &Screen' },
     ],
   });
 }
@@ -116,19 +153,7 @@ function getMacApplicationMenu(): Array<MenuItem> {
       role:  'fileMenu',
     }),
     getEditMenu(true),
-    Electron.app.isPackaged ? new MenuItem({
-      label:   'View',
-      submenu: [
-        { role: 'resetZoom' },
-        { role: 'zoomIn' },
-        { role: 'zoomOut' },
-        { type: 'separator' },
-        { role: 'togglefullscreen' },
-      ],
-    }) : new MenuItem({
-      label: 'View',
-      role:  'viewMenu',
-    }),
+    getViewMenu(),
     new MenuItem({
       label: '&Window',
       role:  'windowMenu',
@@ -151,23 +176,7 @@ function getWindowsApplicationMenu(): Array<MenuItem> {
       ],
     }),
     getEditMenu(false),
-    new MenuItem({
-      label:   '&View',
-      role:    'viewMenu',
-      submenu: [
-        ...(Electron.app.isPackaged ? [] : [
-          { role: 'reload', label: '&Reload' },
-          { role: 'forceReload', label: '&Force Reload' },
-          { role: 'toggleDevTools', label: 'Toggle &Developer Tools' },
-          { type: 'separator' },
-        ] as MenuItemConstructorOptions[]),
-        { role: 'resetZoom', label: '&Actual Size' },
-        { role: 'zoomIn', label: 'Zoom &In' },
-        { role: 'zoomOut', label: 'Zoom &Out' },
-        { type: 'separator' },
-        { role: 'togglefullscreen', label: 'Toggle Full &Screen' },
-      ],
-    }),
+    getViewMenu(),
     getHelpMenu(false),
   ];
 }
@@ -183,10 +192,37 @@ function getPreferencesMenuItem(): MenuItemConstructorOptions[] {
       visible:             true,
       registerAccelerator: false,
       accelerator:         'CmdOrCtrl+,',
-      click() {
-        openMain(true);
-      },
+      click:               openPreferences,
     },
     { type: 'separator' },
   ];
+}
+
+/**
+ * Adjusts the zoom level for the focused window by the desired increment.
+ * Also emits an IPC request to the webContents to trigger a resize of the
+ * extensions view.
+ * @param focusedWindow The window that has focus
+ * @param zoomLevelAdjustment The desired increment to adjust the zoom level by
+ */
+function adjustZoomLevel(focusedWindow: Electron.BaseWindow | undefined, zoomLevelAdjustment: number) {
+  if (!focusedWindow || !(focusedWindow instanceof Electron.BrowserWindow)) {
+    return;
+  }
+
+  const { webContents } = focusedWindow;
+  const currentZoomLevel = webContents.getZoomLevel();
+  const desiredZoomLevel = zoomLevelAdjustment === 0 ? zoomLevelAdjustment : currentZoomLevel + zoomLevelAdjustment;
+
+  webContents.setZoomLevel(desiredZoomLevel);
+
+  // Also sync the zoom level of any child views (e.g. the extensions view in
+  // the main window).
+  for (const child of focusedWindow.contentView.children) {
+    if (child instanceof Electron.WebContentsView) {
+      child.webContents.setZoomLevel(desiredZoomLevel);
+    }
+  }
+  // For the main window, this triggers resizing the extensions view.
+  setImmediate(() => webContents.send('extensions/getContentArea'));
 }

@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package cmd
 
 import (
@@ -63,6 +64,8 @@ func init() {
 	dockerproxyServeCmd.Flags().String("endpoint", platform.DefaultEndpoint, "Endpoint to listen on")
 	dockerproxyServeCmd.Flags().String("proxy-endpoint", defaultProxyEndpoint, "Endpoint dockerd is listening on")
 	dockerproxyServeViper.AutomaticEnv()
-	dockerproxyServeViper.BindPFlags(dockerproxyServeCmd.Flags())
+	if err := dockerproxyServeViper.BindPFlags(dockerproxyServeCmd.Flags()); err != nil {
+		logrus.WithError(err).Fatal("Failed to set up flags")
+	}
 	dockerproxyCmd.AddCommand(dockerproxyServeCmd)
 }

@@ -1,58 +1,86 @@
 <template>
-  <div>
+  <div class="first-run-container">
     <h2 data-test="k8s-settings-header">
-      Welcome to Rancher Desktop
+      Welcome to Rancher Desktop by SUSE
     </h2>
-    <Checkbox
+    <rd-checkbox
       label="Enable Kubernetes"
-      :value="settings.kubernetes.enabled"
+      :value="hasVersions && settings.kubernetes.enabled"
+      :is-locked="kubernetesLocked"
+      :disabled="!hasVersions"
       @input="handleDisableKubernetesCheckbox"
     />
-    <label>
-      Please select a Kubernetes version{{ offlineCheck() }}:
-      <select v-model="settings.kubernetes.version" class="select-k8s-version" @change="onChange">
+    <rd-fieldset
+      :legend-text="t('firstRun.kubernetesVersion.legend') + offlineCheck()"
+    >
+      <rd-select
+        v-model="settings.kubernetes.version"
+        :is-locked="kubernetesVersionLocked"
+        class="select-k8s-version"
+        @change="onChange"
+      >
         <!--
             - On macOS Chrome / Electron can't style the <option> elements.
             - We do the best we can by instead using <optgroup> for a recommended section.
             -->
-        <optgroup v-if="recommendedVersions.length > 0" label="Recommended Versions">
+        <optgroup
+          v-if="recommendedVersions.length > 0"
+          label="Recommended Versions"
+        >
           <option
             v-for="item in recommendedVersions"
-            :key="item.version.version"
-            :value="item.version.version"
-            :selected="item.version.version === unwrappedDefaultVersion"
+            :key="item.version"
+            :value="item.version"
+            :selected="item.version === unwrappedDefaultVersion"
           >
             {{ versionName(item) }}
           </option>
         </optgroup>
-        <optgroup v-if="nonRecommendedVersions.length > 0" label="Other Versions">
+        <optgroup
+          v-if="nonRecommendedVersions.length > 0"
+          label="Other Versions"
+        >
           <option
             v-for="item in nonRecommendedVersions"
-            :key="item.version.version"
-            :value="item.version.version"
-            :selected="item.version.version === unwrappedDefaultVersion"
+            :key="item.version"
+            :value="item.version"
+            :selected="item.version === unwrappedDefaultVersion"
           >
-            v{{ item.version.version }}
+            v{{ item.version }}
           </option>
         </optgroup>
-      </select>
-    </label>
-    <engine-selector
-      :container-engine="settings.kubernetes.containerEngine"
-      @change="onChangeEngine"
-    />
-    <path-management-selector
+      </rd-select>
+    </rd-fieldset>
+    <rd-fieldset
+      :legend-text="t('containerEngine.label')"
+      :is-locked="engineSelectorLocked"
+    >
+      <engine-selector
+        :container-engine="settings.containerEngine.name"
+        :is-locked="engineSelectorLocked"
+        @change="onChangeEngine"
+      />
+    </rd-fieldset>
+    <rd-fieldset
       v-if="pathManagementRelevant"
-      :value="pathManagementStrategy"
-      @input="setPathManagementStrategy"
-    />
+      :legend-text="t('pathManagement.label')"
+      :legend-tooltip="t('pathManagement.tooltip', { }, true)"
+      :is-locked="pathManagementSelectorLocked"
+    >
+      <path-management-selector
+        :value="pathManagementStrategy"
+        :is-locked="pathManagementSelectorLocked"
+        :show-label="false"
+        @input="setPathManagementStrategy"
+      />
+    </rd-fieldset>
     <div class="button-area">
       <button
         data-test="accept-btn"
         class="role-primary"
         @click="close"
       >
-        Accept
+        {{ t('firstRun.ok') }}
       </button>
     </div>
   </div>
@@ -61,26 +89,39 @@
 <script lang="ts">
 import os from 'os';
 
-import { Checkbox } from '@rancher/components';
+import _ from 'lodash';
 import Vue from 'vue';
 import { mapGetters } from 'vuex';
 
-import { VersionEntry } from '@pkg/backend/k8s';
 import EngineSelector from '@pkg/components/EngineSelector.vue';
 import PathManagementSelector from '@pkg/components/PathManagementSelector.vue';
-import type { Settings, ContainerEngine } from '@pkg/config/settings';
+import RdSelect from '@pkg/components/RdSelect.vue';
+import RdCheckbox from '@pkg/components/form/RdCheckbox.vue';
+import RdFieldset from '@pkg/components/form/RdFieldset.vue';
+import { defaultSettings } from '@pkg/config/settings';
+import type { ContainerEngine, Settings } from '@pkg/config/settings';
 import { PathManagementStrategy } from '@pkg/integrations/pathManager';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
+import { highestStableVersion, VersionEntry } from '@pkg/utils/kubeVersions';
+import { RecursivePartial } from '@pkg/utils/typeUtils';
 
 export default Vue.extend({
   components: {
-    Checkbox, EngineSelector, PathManagementSelector,
+    RdFieldset,
+    RdCheckbox,
+    EngineSelector,
+    PathManagementSelector,
+    RdSelect,
   },
   layout: 'dialog',
   data() {
     return {
-      settings: { kubernetes: {} } as Settings,
-      versions: [] as VersionEntry[],
+      settings:                     defaultSettings,
+      kubernetesLocked:             false,
+      kubernetesVersionLocked:      false,
+      engineSelectorLocked:         false,
+      pathManagementSelectorLocked: false,
+      versions:                     [] as VersionEntry[],
 
       // If cachedVersionsOnly is true, it means we're offline and showing only the versions in the cache,
       // not all the versions listed in <cache>/rancher-desktop/k3s-versions.json
@@ -91,15 +132,16 @@ export default Vue.extend({
     ...mapGetters('applicationSettings', { pathManagementStrategy: 'pathManagementStrategy' }),
     /** The version that should be pre-selected as the default value. */
     defaultVersion(): VersionEntry {
-      const version = this.recommendedVersions.find(v => (v.channels ?? []).includes('stable'));
-
-      return version ?? this.recommendedVersions[0] ?? this.nonRecommendedVersions[0];
+      return highestStableVersion(this.recommendedVersions) ?? this.nonRecommendedVersions[0];
     },
     // This field is needed because the template-parser doesn't like `defaultVersion?.version.version`
     unwrappedDefaultVersion(): string {
       const wrappedSemver = this.defaultVersion;
 
-      return wrappedSemver ? wrappedSemver.version.version : '';
+      return wrappedSemver ? wrappedSemver.version : '';
+    },
+    hasVersions(): boolean {
+      return this.versions.length > 0;
     },
     /** Versions that are the tip of a channel */
     recommendedVersions(): VersionEntry[] {
@@ -113,6 +155,10 @@ export default Vue.extend({
       return os.platform() === 'linux' || os.platform() === 'darwin';
     },
   },
+  beforeMount() {
+    // Save default settings on closing window.
+    window.addEventListener('beforeunload', this.close);
+  },
   mounted() {
     ipcRenderer.on('settings-read', (event, settings) => {
       this.$data.settings = settings;
@@ -122,51 +168,57 @@ export default Vue.extend({
       this.versions = versions;
       this.cachedVersionsOnly = cachedVersionsOnly;
       this.settings.kubernetes.version = this.unwrappedDefaultVersion;
+      if (!this.hasVersions) {
+        ipcRenderer.invoke('settings-write', { kubernetes: { enabled: false } });
+      }
       // Manually send the ready event here, as we do not use the normal
       // "dialog/populate" event.
       ipcRenderer.send('dialog/ready');
     });
     ipcRenderer.on('settings-update', (event, config) => {
-      this.settings.kubernetes.containerEngine = config.kubernetes.containerEngine;
+      this.settings.containerEngine.name = config.containerEngine.name;
       this.settings.kubernetes.enabled = config.kubernetes.enabled;
     });
     ipcRenderer.send('k8s-versions');
     if (this.pathManagementRelevant) {
       this.setPathManagementStrategy(PathManagementStrategy.RcFiles);
     }
+    ipcRenderer.invoke('get-locked-fields').then((lockedFields) => {
+      this.$data.kubernetesLocked = _.get(lockedFields, 'kubernetes.enabled');
+      this.$data.kubernetesVersionLocked = _.get(lockedFields, 'kubernetes.version');
+      this.$data.engineSelectorLocked = _.get(lockedFields, 'containerEngine.name');
+      this.$data.pathManagementSelectorLocked = _.get(lockedFields, 'application.pathManagementStrategy');
+    });
+  },
+  beforeDestroy() {
+    window.removeEventListener('beforeunload', this.close);
   },
   methods: {
+    async commitChanges(settings: RecursivePartial<Settings>) {
+      try {
+        return await ipcRenderer.invoke('settings-write', settings);
+      } catch (ex) {
+        console.log(`invoke settings-write failed: `, ex);
+      }
+    },
     onChange() {
-      ipcRenderer.invoke(
-        'settings-write',
-        {
-          kubernetes:             { version: this.settings.kubernetes.version },
-          pathManagementStrategy: this.pathManagementStrategy,
-        });
+      return this.commitChanges({
+        application: { pathManagementStrategy: this.pathManagementStrategy },
+        kubernetes:  {
+          version: this.settings.kubernetes.version,
+          enabled: this.settings.kubernetes.enabled && this.hasVersions,
+        },
+      });
     },
     close() {
       this.onChange();
       window.close();
     },
     onChangeEngine(desiredEngine: ContainerEngine) {
-      try {
-        ipcRenderer.invoke(
-          'settings-write',
-          { kubernetes: { containerEngine: desiredEngine } },
-        );
-      } catch (err) {
-        console.log('invoke settings-write failed: ', err);
-      }
+      return this.commitChanges({ containerEngine: { name: desiredEngine } });
     },
     handleDisableKubernetesCheckbox(value: boolean) {
-      try {
-        ipcRenderer.invoke(
-          'settings-write',
-          { kubernetes: { enabled: value } },
-        );
-      } catch (err) {
-        console.log('invoke settings-write failed: ', err);
-      }
+      return this.commitChanges({ kubernetes: { enabled: value } });
     },
     /**
      * Get the display name of a given version.
@@ -176,20 +228,26 @@ export default Vue.extend({
       const names = (version.channels ?? []).filter(ch => !/^v?\d+/.test(ch));
 
       if (names.length > 0) {
-        return `v${ version.version.version } (${ names.join(', ') })`;
+        return `v${ version.version } (${ names.join(', ') })`;
       }
 
-      return `v${ version.version.version }`;
+      return `v${ version.version }`;
     },
     setPathManagementStrategy(val: PathManagementStrategy) {
       this.$store.dispatch('applicationSettings/setPathManagementStrategy', val);
     },
     offlineCheck() {
-      return this.cachedVersionsOnly ? ' (cached versions only)' : '';
+      return this.cachedVersionsOnly ? ` ${ this.t('firstRun.kubernetesVersion.cachedOnly') }` : '';
     },
   },
 });
 </script>
+
+<style lang="scss">
+  html {
+    height: initial;
+  }
+</style>
 
 <style lang="scss" scoped>
   .button-area {
@@ -198,5 +256,9 @@ export default Vue.extend({
 
   .select-k8s-version {
     margin-top: 0.5rem;
+  }
+
+  .first-run-container {
+    width: 26rem;
   }
 </style>

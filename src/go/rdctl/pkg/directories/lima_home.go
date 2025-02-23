@@ -20,28 +20,11 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"runtime"
+	"path/filepath"
 )
 
-func SetupLimaHome() error {
-	var candidatePath string
-	if runtime.GOOS == "linux" {
-		dataDir := os.Getenv("XDG_DATA_HOME")
-		if dataDir == "" {
-			homeDir, err := os.UserHomeDir()
-			if err != nil {
-				return err
-			}
-			dataDir = path.Join(homeDir, ".local", "share")
-		}
-		candidatePath = path.Join(dataDir, "rancher-desktop", "lima")
-	} else {
-		configDir, err := os.UserConfigDir()
-		if err != nil {
-			return err
-		}
-		candidatePath = path.Join(configDir, "rancher-desktop", "lima")
-	}
+func SetupLimaHome(appHome string) error {
+	candidatePath := path.Join(appHome, "lima")
 	stat, err := os.Stat(candidatePath)
 	if err != nil {
 		return fmt.Errorf("can't find the lima-home directory at %q", candidatePath)
@@ -49,6 +32,17 @@ func SetupLimaHome() error {
 	if !stat.Mode().IsDir() {
 		return fmt.Errorf("path %q exists but isn't a directory", candidatePath)
 	}
-	os.Setenv("LIMA_HOME", candidatePath)
-	return nil
+	return os.Setenv("LIMA_HOME", candidatePath)
+}
+
+func GetLimactlPath() (string, error) {
+	execPath, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	execPath, err = filepath.EvalSymlinks(execPath)
+	if err != nil {
+		return "", err
+	}
+	return path.Join(path.Dir(path.Dir(execPath)), "lima", "bin", "limactl"), nil
 }

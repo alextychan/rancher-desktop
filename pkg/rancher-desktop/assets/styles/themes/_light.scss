@@ -318,8 +318,8 @@ BODY, .theme-light {
   --nav-expander-hover         : #{darken($medium, 10%)};
   --nav-border                 : #{$medium};
   --nav-border-size            : 1px;
-  --footer-bg                  : transparent;
-  --footer-height              : 0px;
+  --footer-bg                  : #{$lightest};
+  --footer-border              : #{$medium};
 
   --topmenu-bg                 : #{$lightest};
   --topmenu-text               : #{$darkest};
@@ -350,7 +350,11 @@ BODY, .theme-light {
   --checkbox-border            : #{$medium};
   --checkbox-tick-disabled     : #{darken($disabled, 40%)};
   --checkbox-disabled-bg       : #{$disabled};
+  --checkbox-tick-locked       : #{$darkest};
+  --checkbox-locked-bg         : #{lighten($disabled, 5%)};
   --checkbox-ticked-bg         : #{$link};
+  --checkbox-locked-border     : #{lighten($disabled, 5%)};
+  --checkbox-locked-shadow     : #{lighten($disabled, 5%)};
 
   --dropdown-bg                : #{$lightest};
   --dropdown-border            : #{$medium};
@@ -362,6 +366,7 @@ BODY, .theme-light {
   --dropdown-hover-bg          : var(--primary);
   --dropdown-disabled-text     : var(--muted);
   --dropdown-disabled-bg       : #{$disabled};
+  --dropdown-locked-text       : #{$darkest};
 
   // UNUSED?
   --card-header                : var(--primary-banner-bg);
@@ -380,6 +385,10 @@ BODY, .theme-light {
   --input-disabled-border      : #{darken($medium, 10%)};
   --input-disabled-placeholder : #{darken($medium, 15%)};
   --input-addon-bg             : #{$darker};
+  --input-locked-text          : #{$darkest};
+
+  --radio-locked-bg            : var(--body-bg);
+  --radio-locked-shadow        : var(--body-bg);
 
   --progress-bg                : #{$medium};
   --progress-divider           : #{$medium};
@@ -410,6 +419,8 @@ BODY, .theme-light {
   --tooltip-text               : var(--tag-primary);
   --tooltip-bg-warning         : #{rgba($warning, 0.8)};
   --tooltip-text-warning       : var(--body-text);
+
+  --icon-circle                : #{$medium};
 
   --tabbed-border              : #{$medium};
   --tabbed-sidebar-bg          : #{$lighter};

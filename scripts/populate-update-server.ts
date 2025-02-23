@@ -15,7 +15,6 @@
  *   GITHUB_REPOSITORY: The GitHub owner/repository (from GitHub Actions).
  *   GITHUB_SHA:        Commit hash (if creating a new release).
  *   GITHUB_ACTOR:      User that triggered this, github.actor
- *   RD_SETUP_EXE:      The installer (exe file) to upload.
  *   RD_SETUP_MSI:      The installer (msi file) to upload.
  *   RD_MACX86_ZIP:     The macOS (x86_64) zip archive to upload.
  *   RD_MACARM_ZIP:     The macOS (aarch64) zip archive to upload.
@@ -30,7 +29,8 @@ import path from 'path';
 import { Octokit } from 'octokit';
 import yaml from 'yaml';
 
-import { spawnFile } from '@pkg/utils/childProcess';
+import { simpleSpawn } from './simple_process';
+
 import { defined } from '@pkg/utils/typeUtils';
 
 /** Read input from the environment; throws an error if unset. */
@@ -125,7 +125,6 @@ async function getOctokit(): Promise<Octokit> {
 
 async function updateRelease(octokit: Octokit, owner: string, repo: string, tag: string) {
   const files = {
-    exe:    await getChecksum('RD_SETUP_EXE', `Rancher.Desktop.Setup.${ tag }.exe`),
     msi:    await getChecksum('RD_SETUP_MSI', `Rancher.Desktop.Setup.${ tag }.msi`),
     macx86: await getChecksum('RD_MACX86_ZIP', `Rancher.Desktop-${ tag }-mac.x86_64.zip`),
     macarm: await getChecksum('RD_MACARM_ZIP', `Rancher.Desktop-${ tag }-mac.aarch64.zip`),
@@ -229,7 +228,7 @@ async function updatePages(tag: string) {
   await fs.promises.writeFile(path.join(getInput('RD_OUTPUT_DIR'), 'response.json'),
     JSON.stringify(response),
     'utf-8');
-  await spawnFile('git',
+  await simpleSpawn('git',
     [
       '-c', `user.name=${ getInput('GITHUB_ACTOR') }`,
       '-c', `user.email=${ getInput('GITHUB_ACTOR') }@users.noreply.github.com`,
@@ -238,7 +237,7 @@ async function updatePages(tag: string) {
       stdio: ['ignore', 'inherit', 'inherit'],
       cwd:   getInput('RD_OUTPUT_DIR'),
     });
-  await spawnFile('git',
+  await simpleSpawn('git',
     ['push'], {
       stdio: ['ignore', 'inherit', 'inherit'],
       cwd:   getInput('RD_OUTPUT_DIR'),
@@ -253,7 +252,7 @@ async function main() {
   const packageURL = new URL(JSON.parse(await fs.promises.readFile('package.json', 'utf-8')).repository.url);
   const [packageOwner, packageRepo] = packageURL.pathname.replace(/\.git$/, '').split('/').filter(x => x);
   const buildInfo = yaml.parse(await fs.promises.readFile(buildInfoPath, 'utf-8'));
-  const tag: string = buildInfo.version.replace(/^v?/, 'v');
+  const tag: string = buildInfo.extraMetadata.version.replace(/^v?/, 'v');
 
   console.log(`Publishing ${ tag } from ${ owner }/${ repo } (upstream is ${ packageOwner }/${ packageRepo })...`);
   if (packageOwner === owner && packageRepo === repo) {

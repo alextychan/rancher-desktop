@@ -21,6 +21,7 @@
 </template>
 
 <script lang="ts">
+
 import Vue from 'vue';
 
 import type { ServiceEntry } from '@pkg/backend/k8s';
@@ -153,6 +154,6 @@ export default Vue.extend({
 
 <style scoped>
   .content {
-    padding: 20px;
+    padding-top: 13px;
   }
 </style>

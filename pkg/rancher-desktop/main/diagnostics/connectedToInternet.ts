@@ -5,6 +5,7 @@ import { DiagnosticsCategory, DiagnosticsChecker } from './types';
 import Logging from '@pkg/utils/logging';
 
 const console = Logging.diagnostics;
+let allowSuccessfulConnectionDiagnosticLog = true;
 
 // Returns the timeout, in milliseconds, for the network connectivity check.
 function getTimeout(): number {
@@ -28,20 +29,33 @@ async function checkNetworkConnectivity(): Promise<boolean> {
   const timeout = getTimeout();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
   let connected: boolean;
+  const runningConnectivityTestMessage = `Running connectivity test with timeout of ${ timeout } ms`;
 
-  console.log(`Running connectivity test with timeout of ${ timeout } ms`);
   try {
-    await fetch('https://example.com/', { signal: controller.signal });
-    console.log('Connection test completed successfully');
+    // Using HTTP request that returns a 301 redirect response instead of a 20+ kB web page
+    const resp = await fetch('http://docs.rancherdesktop.io/', { signal: controller.signal, redirect: 'manual' });
+    const location = resp.headers.get('Location') || '';
+
+    // Verify that we get the original redirect and not a captive portal
+    if (resp.status !== 301 || !location.includes('docs.rancherdesktop.io')) {
+      throw new Error(`expected status 301 (was ${ resp.status }) and location including docs.rancherdesktop.io (was ${ location })`);
+    }
+    if (allowSuccessfulConnectionDiagnosticLog) {
+      console.log(runningConnectivityTestMessage);
+      console.log('Connection test completed successfully');
+      allowSuccessfulConnectionDiagnosticLog = false;
+    }
     connected = true;
   } catch (error: any) {
     let errorMessage = error;
 
+    console.log(runningConnectivityTestMessage);
     if (error.name === 'AbortError') {
       errorMessage = `timed out after ${ timeout } ms`;
     }
     console.log(`Got error while checking connectivity: ${ errorMessage }`);
     connected = false;
+    allowSuccessfulConnectionDiagnosticLog = true;
   } finally {
     clearTimeout(timeoutId);
   }

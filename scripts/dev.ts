@@ -7,9 +7,9 @@
 import childProcess from 'child_process';
 import events from 'events';
 import https from 'https';
-import util from 'util';
 
 import fetch from 'node-fetch';
+import psTree from 'ps-tree';
 
 import buildUtils from './lib/build-utils';
 
@@ -67,23 +67,15 @@ class DevRunner extends events.EventEmitter {
       };
     }
 
-    return { home: 'http://localhost:8888/pages/General' };
+    return { home: 'http://localhost:8888' };
   }
 
   #mainProcess: childProcess.ChildProcess | null = null;
   async startMainProcess() {
+    console.info('Main process: starting...');
     try {
       await buildUtils.buildMain();
-      const rendererEnv = this.rendererEnv();
 
-      // Wait for the renderer to finish, so that the output from nuxt doesn't
-      // clobber debugging output.
-      while (true) {
-        if ((await fetch(rendererEnv.home, { agent: rendererEnv.agent })).ok) {
-          break;
-        }
-        await util.promisify(setTimeout)(1000);
-      }
       this.#mainProcess = this.spawn(
         'Main process',
         'node',
@@ -110,34 +102,121 @@ class DevRunner extends events.EventEmitter {
   /**
    * Start the renderer process.
    */
-  startRendererProcess(): Promise<void> {
-    this.#rendererProcess = this.spawn(
-      'Renderer process',
-      'node',
-      'node_modules/nuxt/bin/nuxt.js',
-      'dev',
-      '--hostname',
-      'localhost',
-      '--port',
-      this.rendererPort.toString(),
-      buildUtils.rendererSrcDir,
-    );
+  async startRendererProcess(): Promise<void> {
+    await buildUtils.buildPreload();
 
-    return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      console.info('Renderer process: starting...');
+      process.env.VUE_CLI_SERVICE_CONFIG_PATH = 'pkg/rancher-desktop/vue.config.js';
+
+      this.#rendererProcess = this.spawn(
+        'Renderer process',
+        process.execPath,
+        '--stack-size=16384',
+        'node_modules/@vue/cli-service/bin/vue-cli-service.js',
+        'serve',
+        '--host',
+        'localhost',
+        '--port',
+        this.rendererPort.toString(),
+        '--skip-plugins',
+        'eslint',
+      );
+
+      // Listen for the 'exit' event of the child process and resolve or reject the Promise accordingly.
+      this.#rendererProcess.on('exit', (code, _signal) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(`Renderer build failed with code ${ code }`));
+        }
+      });
+
+      // Wait for the renderer to finish, so that vue-cli output doesn't
+      // clobber debugging output.
+      const rendererEnv = this.rendererEnv();
+
+      const maxRetries = 30;
+      let retryCount = 0;
+      const retryInterval = 1000;
+
+      const checkDevServer = async() => {
+        try {
+          const response = await fetch(rendererEnv.home, { agent: rendererEnv.agent });
+
+          if (response.ok) {
+            console.info('Renderer process: dev server started');
+            resolve();
+          } else {
+            // Retry if response is not okay
+            retryCount++;
+            if (retryCount < maxRetries) {
+              setTimeout(checkDevServer, retryInterval);
+            } else {
+              reject(new Error(`Renderer process: failed to connect`));
+            }
+          }
+        } catch (error) {
+          // Retry if fetch throws an error
+          retryCount++;
+          if (retryCount < maxRetries) {
+            setTimeout(checkDevServer, retryInterval);
+          } else {
+            reject(new Error(`Renderer process: failed to connect`));
+          }
+        }
+      };
+
+      checkDevServer().catch(e => console.error(e));
+    });
+  }
+
+  /**
+   * Kill child processes associated with the given parent PID.
+   * @param parentPID - Parent PID whose child processes need to be terminated.
+   */
+  killChildProcesses(parentPID: number) {
+    psTree(parentPID, (err: Error | null, children: readonly psTree.PS[]) => {
+      if (err) {
+        console.error(`Error getting child processes with PID ${ parentPID }:`, { err });
+      } else {
+        children.forEach((child: psTree.PS) => {
+          try {
+            process.kill(Number(child.PID));
+          } catch (error: any) {
+            if (error.code === 'ESRCH') {
+              console.log(`Child process with PID ${ child.PID } not found.`);
+            } else {
+              console.error(`Error killing child process with PID ${ child.PID }: ${ error.message }`);
+            }
+          }
+        });
+      }
+    });
   }
 
   exit() {
-    this.#rendererProcess?.kill();
+    // Terminate the renderer process if it exists
+    if (this.#rendererProcess) {
+      this.#rendererProcess.kill();
+
+      if (this.#rendererProcess.pid) {
+        this.killChildProcesses(this.#rendererProcess.pid);
+      }
+
+      // Set to null in the event that exit() invokes multiple times
+      this.#rendererProcess = null;
+    }
+
     this.#mainProcess?.kill();
   }
 
   async run() {
     process.env.NODE_ENV = 'development';
     try {
-      await buildUtils.wait(
-        () => this.startRendererProcess(),
-        () => this.startMainProcess(),
-      );
+      await this.startRendererProcess();
+      await this.startMainProcess();
+
       await new Promise((resolve, reject) => {
         this.on('error', reject);
       });

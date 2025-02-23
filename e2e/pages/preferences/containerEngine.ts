@@ -1,4 +1,4 @@
-import { Page, Locator } from 'playwright';
+import type { Page, Locator } from '@playwright/test';
 
 export class ContainerEngineNav {
   readonly page: Page;
@@ -7,6 +7,8 @@ export class ContainerEngineNav {
   readonly tabAllowedImages: Locator;
   readonly containerEngine: Locator;
   readonly allowedImages: Locator;
+  readonly allowedImagesCheckbox: Locator;
+  readonly enabledLockedField: Locator;
 
   constructor(page: Page) {
     this.page = page;
@@ -15,5 +17,7 @@ export class ContainerEngineNav {
     this.tabAllowedImages = page.locator('.tab >> text=Allowed Images');
     this.containerEngine = page.locator('[data-test="containerEngine"]');
     this.allowedImages = page.locator('[data-test="allowedImages"]');
+    this.allowedImagesCheckbox = page.getByTestId('allowedImagesCheckbox');
+    this.enabledLockedField = this.allowedImagesCheckbox.locator('.icon-lock');
   }
 }

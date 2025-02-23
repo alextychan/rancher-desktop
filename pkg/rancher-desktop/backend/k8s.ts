@@ -1,27 +1,19 @@
 import semver from 'semver';
 
 import { BackendSettings, RestartReasons } from './backend';
-import { ServiceEntry } from './client';
-import { ExtraRequiresReasons } from './k3sHelper';
+import K3sHelper, { ExtraRequiresReasons } from './k3sHelper';
 
 import EventEmitter from '@pkg/utils/eventEmitter';
+import { SemanticVersionEntry } from '@pkg/utils/kubeVersions';
 import { RecursivePartial } from '@pkg/utils/typeUtils';
+
+import type { ServiceEntry } from './kube/client';
 
 export { State, BackendError as KubernetesError } from './backend';
 export type {
   BackendSettings, FailureDetails, RestartReasons, BackendProgress as KubernetesProgress,
 } from './backend';
-export type { ServiceEntry } from './client';
-
-/**
- * VersionEntry describes a version of K3s.
- */
-export interface VersionEntry {
-  /** The version being described. This includes any build-specific data. */
-  version: semver.SemVer;
-  /** A string describing the channels that include this version, if any. */
-  channels?: string[];
-}
+export type { ServiceEntry } from './kube/client';
 
 /**
  * KubernetesBackendEvents describes the events that may be emitted by a
@@ -49,11 +41,6 @@ export interface KubernetesBackendEvents {
    * Emitted when k8s is running on a new port
    */
   'current-port-changed'(port: number): void;
-
-  /**
-   * Emitted when the checkForExistingKimBuilder setting pref changes
-   */
-  'kim-builder-uninstalled'(): void;
 }
 
 export interface KubernetesBackend extends EventEmitter<KubernetesBackendEvents>, KubernetesBackendPortForwarder {
@@ -61,7 +48,7 @@ export interface KubernetesBackend extends EventEmitter<KubernetesBackendEvents>
    * The versions that are available to install, sorted as would be displayed to
    * the user.
    */
-  availableVersions: Promise<VersionEntry[]>;
+  availableVersions: Promise<SemanticVersionEntry[]>;
 
   /**
    * Used to let the UI know whether it was sent all potentially supported k8s versions.
@@ -107,7 +94,7 @@ export interface KubernetesBackend extends EventEmitter<KubernetesBackendEvents>
   /**
    * Start running a pre-installed version of Kubernetes.
    */
-  start(config: BackendSettings, kubernetesVersion: semver.SemVer): Promise<string>;
+  start(config: BackendSettings, kubernetesVersion: semver.SemVer): Promise<void>;
 
   /**
    * Stop the Kubernetes backend.
@@ -129,6 +116,8 @@ export interface KubernetesBackend extends EventEmitter<KubernetesBackendEvents>
    * given new configuration been applied on top of the existing old configuration.
    */
   requiresRestartReasons(oldConfig: BackendSettings, newConfig: RecursivePartial<BackendSettings>, extras?: ExtraRequiresReasons): Promise<RestartReasons>;
+
+  readonly k3sHelper: K3sHelper;
 }
 
 export interface KubernetesBackendPortForwarder {
@@ -147,7 +136,6 @@ export interface KubernetesBackendPortForwarder {
    * @param namespace The namespace containing the service to forward.
    * @param service The name of the service to forward.
    * @param k8sPort The internal port of the service to forward.
-   * @param hostPort The host port to listen on for the forwarded port. Pass 0 for a random port.
    */
   cancelForward(namespace: string, service: string, k8sPort: number | string): Promise<void>;
 }

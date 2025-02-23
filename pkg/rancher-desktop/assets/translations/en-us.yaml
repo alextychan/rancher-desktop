@@ -114,6 +114,7 @@ nav:
     setLoginPage: Set as login page
     restoreCards: Restore hidden cards
   userMenu:
+    clusterDashboard: Cluster Dashboard
     preferences: Preferences
     accountAndKeys: Account & API Keys
     logOut: Log Out
@@ -135,11 +136,20 @@ product:
   settings: Global Settings
   clusterManagement: Cluster Management
   monitoring: Monitoring
-  mcapps: Mutli-cluster Apps
+  mcapps: Multi-cluster Apps
+  version: Version
+  versionChecking: (checking...)
+  networkStatus: Network status
+  kubernetesVersion: Kubernetes
+  containerEngine:
+    fullName: Container Engine
+    abbreviation: CE
+  notFound: not found
+  deactivated: deactivated
 
 suffix:
   percent: "%"
-  milliCpus: mili CPUs
+  milliCpus: milli CPUs
   cpus: CPUs
   ib: iB
   mib: MiB
@@ -166,9 +176,46 @@ suffix:
 app:
   name: Rancher Desktop
   update: "There's one last step to finish updating Rancher Desktop"
+firstRun:
+  kubernetesVersion:
+    legend: Kubernetes Version
+    cachedOnly: (cached versions only)
+  ok: OK
+marketplace:
+  title: Extensions
+  noResults: No extension found for the search criteria
+  tabs:
+    catalog: Catalog
+    installed: Installed
+  banners:
+    install: Extension {name} has been installed.
+    uninstall: Extension {name} has been removed.
+  sidebar:
+    installButton:
+      label: Install
+      loading: Installing...
+    uninstallButton:
+      label: Remove
+      loading: Removing...
+  moreInfo: More information
+containers:
+  title: Containers
+  sortableTables:
+    noRows: There are no containers to show
+  manage:
+    table:
+      header:
+        state: State
+        containerName: Name
+        image: Image
+        ports: Port(s)
+        started: Uptime
+        actions: Actions
 
 images:
   title: Images
+  sortableTables:
+    noRows: There are no images to show
   state:
     k8sUnready: Waiting for Kubernetes to be ready
     imagesUnready: Waiting for image manager to be ready
@@ -238,8 +285,10 @@ k8s:
     cancel: Cancel
 portForwarding:
   title: Port Forwarding
+  sortableTables:
+    noRows: There are no port forwarding entries to show
 general:
-  title: Welcome to Rancher Desktop
+  title: Welcome to Rancher Desktop by SUSE
   description: Rancher Desktop provides Kubernetes and image management through the use of a desktop application.
 about:
   title: About
@@ -260,25 +309,117 @@ about:
   downloadCLI:
     title: CLI Downloads
 
+application:
+  behavior:
+    autoStart:
+      legendText: Startup
+      label: Automatically start at login
+    background:
+      legendText: Background
+      legendTooltip: >
+        Hide the app window when Rancher Desktop is running in the background.
+        It can be opened via the Notification Icon (if visible) or by running Rancher Desktop from the Applications menu.
+    startInBackground:
+      label: Start in the background
+    windowQuitOnClose:
+      label: Quit when closing application window
+    notificationIcon:
+      legendText: Notification Icon
+      label: Hide Notification Icon
+
+virtualMachine:
+  networkingTunnel:
+    legend: Networking Tunnel
+    label: Enable networking tunnel
+  mount:
+    type:
+      legend: Mount Type
+      options:
+        reverse-sshfs:
+          label: reverse-sshfs
+          description: Exposes the filesystem by running an SFTP server.
+        9p:
+          label: 9p
+          description: Exposes the filesystem by using QEMU's virtio-9p-pci devices.
+          options:
+            cacheMode:
+              legend: Cache Mode
+              tooltip: Caching policy to be used
+              options:
+                none: none
+                loose: loose
+                fscache: fscache
+                mmap: mmap
+            mSizeInKib:
+              legend: Memory Size In KiB
+              tooltip: Maximum package size in KiB
+            protocolVersion:
+              legend: Protocol Version
+              tooltip: 9P protocol version
+              options:
+                9p2000: 9p2000
+                9p2000u: '9p2000.u'
+                9p2000L: '9p2000.L'
+            securityModel:
+              legend: Security Model
+              tooltip: Security model used for the export path
+              options:
+                passthrough: passthrough
+                'mapped-xattr': mapped-xattr
+                'mapped-file': mapped-file
+                none: none
+        virtiofs:
+          label: virtiofs
+          description: Exposes the filesystem by using an Apple Virtualization framework shared directory device.
+  proxy:
+    legend: WSL Proxy
+    label: Enable the proxy used by rancher-desktop
+    addressTitle: Proxy address
+    address: Address
+    port: Port
+    authTitle: Authentication information
+    username: Username
+    password: Password
+    noproxy:
+      legend: No proxy hostname list
+      placeholder: Hostname to not redirect to the proxy
+      errors:
+        duplicate: Error, item is duplicate.
+  type:
+    legend: Virtual Machine Type
+    options:
+      qemu:
+        label: QEMU
+        description: Use the QEMU emulator.
+      vz:
+        label: VZ
+        description: Use the Apple Virtualization framework.
+  useRosetta:
+    legend: VZ Option
+    label: Enable Rosetta support
+
 containerEngine:
   label: Container Engine
   options:
     moby:
       label: dockerd (moby)
-      description: Docker API; use with Docker CLI and k3d.
+      description: Docker API; use with Docker CLI.
     containerd:
       label: containerd
       description: Namespaces for container images; use with nerdctl.
 
+webAssembly:
+  label: WebAssembly (Wasm)
+  enabled: Enabled
+  description: Please read the documentation before enabling the experimental WebAssembly feature!
+
 allowedImages:
-  label: Allowed Image Patterns (Experimental)
+  label: Allowed Image Patterns
   patterns:
     placeholder: Type the image pattern
   errors:
     duplicate: Error, item is duplicate.
   enable: Enable
-  locked:
-    tooltip: Patterns cannot be changed due to Organization's policy
   alert:
     The image name needs to match one of the patterns defined in the Allowed Images preference tab.
 
@@ -307,7 +448,7 @@ legacyIntegrations:
     1.3.0. If you are seeing this message, Rancher Desktop was unable to remove the symlinks
     from the old directory automatically. You should remove them manually to prevent future
     path conflicts.
-  ok: Ok
+  ok: OK
 
 sudoPrompt:
   title: Administrative Access Required
@@ -428,7 +569,7 @@ authConfig:
         title: 'Navigate to the "Credentials" tab to create your OAuth client ID'
         body:
           1: 'Select the "Create Credentials" dropdown, and select "OAuth clientID", then select "Web application".'
-          2: 'Authorized Javascript origins:'
+          2: 'Authorized JavaScript origins:'
           3: 'Authorized redirect URIs:'
           4: 'Click "Create", and then click on the "Download JSON" button.'
           5: 'Upload the downloaded JSON file in the OAuth credentials box.'
@@ -786,7 +927,7 @@ catalog:
     chart: Chart
     error:
       requiresFound: '<a href="{url}">{name}</a> must be installed before you can install this chart.'
-      requiresMissing: 'This chart requires another chart that provides {name}, but none was was found.'
+      requiresMissing: 'This chart requires another chart that provides {name}, but none was found.'
       insufficientCpu: 'This chart requires {need, number} CPU cores, but the cluster only has {have, number} available.'
       insufficientMemory: 'This chart requires {need} of memory, but the cluster only has {have} available.'
     header:
@@ -1204,7 +1345,7 @@ clusterIndexPage:
       buttonText: Configure Gatekeeper
       disabled: OPA Gatekeeper is not configured.
       label: OPA Gatekeeper Constraint Violations
-      noRows: There are no contraints with violations to show.
+      noRows: There are no constraints with violations to show.
     nodes:
       label: Unhealthy Nodes
       noRows: There are no unhealthy nodes to show.
@@ -1589,7 +1730,7 @@ landing:
   learnMore: Learn More
   gettingStarted:
     title: Getting Started
-    body: Take a look at the the quick getting started guide. For Cluster Manager users, learn more about where you can find you favorite features in the Dashboard UI.
+    body: Take a look at the quick getting started guide. For Cluster Manager users, learn more about where you can find you favorite features in the Dashboard UI.
   community:
     title: Community Support
     docs: Docs
@@ -1817,7 +1958,7 @@ login:
   welcome: Welcome to {vendor}
   loggedOut: You have been logged out.
   loginAgain: Log in again to continue.
-  error: An error occured logging in. Please try again.
+  error: An error occurred logging in. Please try again.
   useLocal: Use a local user
   loginWithProvider: Log in with {provider}
   username: Username
@@ -1864,7 +2005,7 @@ monitoring:
     tip: 'Adds labels to the ClusterRoles deployed by the Monitoring chart to <a target="_blank" rel="noopener nofollow noreferrer" href="https://kubernetes.io/docs/reference/access-authn-authz/rbac/#aggregated-clusterroles"> aggregate to the corresponding default k8s admin, edit, and view ClusterRoles.</a>'
   alerting:
     config:
-      label: Alert Manager Cofig
+      label: Alert Manager Config
     enable:
       label: Deploy Alertmanager
     secrets:
@@ -2526,6 +2667,11 @@ prefs:
     'true': Include Prerelease Versions
     'false': Show Releases Only
     label: Helm Charts
+  experimental: Experimental
+  onlyFromVentura_x64: This setting requires macOS 13.0 (Ventura) or later.
+  onlyFromVentura_arm64: This setting requires macOS 13.3 (Ventura) or later.
+  onlyWithVZ_x64: This setting requires using the VZ emulation mode. VZ is only available on macOS 13.0 (Ventura) or later.
+  onlyWithVZ_arm64: This setting requires using the VZ emulation mode. VZ is only available on macOS 13.3 (Ventura) or later.
 
 principal:
   loading: Loading&hellip;
@@ -3074,7 +3220,7 @@ setup:
   confirmPassword: Confirm New Password
   useRandom: Use a randomly generated password
   useManual: Set a specific password to use
-  defaultPasswordError: It looks like this is your first time visting the Rancher UI, but the local admin account password is already set to something unique. Log in with that account below to continue the setup process.
+  defaultPasswordError: It looks like this is your first time visiting the Rancher UI, but the local admin account password is already set to something unique. Log in with that account below to continue the setup process.
   telemetry:
     label: Allow collection of anonymous statistics to help us improve Rancher
     tip:  'Rancher Labs would like to collect a bit of anonymized information
@@ -3584,7 +3730,7 @@ validation:
   boolean: '"{key}" must be a boolean value.'
   chars: '"{key}" contains {count, plural, =1 {an invalid character} other {# invalid characters}}: {chars}'
   custom:
-    missing: 'No validtor exists for { validatorName }! Does the validtor exist in custom-validtors? Is the name spelled correctly?'
+    missing: 'No validator exists for { validatorName }! Does the validator exist in custom-validators? Is the name spelled correctly?'
   dns:
     doubleHyphen: '"{key}" Cannot contain two or more consecutive hyphens'
     hostname:
@@ -3663,10 +3809,10 @@ validation:
       name:
         required: 'Port Rule [{position}] - Name is required.'
       nodePort:
-        requriedInt: 'Port Rule [{position}] - Node Port must be interger values if included.'
+        requriedInt: 'Port Rule [{position}] - Node Port must be integer values if included.'
       port:
         required: 'Port Rule [{position}] - Port is required.'
-        requriedInt: 'Port Rule [{position}] - Port must be interger values if included.'
+        requriedInt: 'Port Rule [{position}] - Port must be integer values if included.'
       targetPort:
         between: 'Port Rule [{position}] - Target Port must be between 1 and 65535'
         iana: 'Port Rule [{position}] - Target Port must be an IANA Service Name or Integer'
@@ -3832,7 +3978,7 @@ workload:
       supplementalGroups: Additional Group IDs
       sysctls: Sysctls
       sysctlsKey: Name
-    standard: Standard Containter
+    standard: Standard Container
     titles:
       container: Container
       command: Command
@@ -4215,7 +4361,7 @@ typeDescription:
   cis.cattle.io.clusterscanprofile: A profile is the configuration for the CIS scan, which is the benchmark versions to use and any specific tests to skip in that benchmark.
   cis.cattle.io.clusterscan: A scan is created to trigger a CIS scan on the cluster based on the defined profile. A report is created after the scan is completed.
   cis.cattle.io.clusterscanreport: A report is the result of a CIS scan of the cluster.
-  management.cattle.io.feature: Feature Flags allow certain {vendor} features to be toggled on and off.  Features that are off by default shoud be considered experimental functionality.
+  management.cattle.io.feature: Feature Flags allow certain {vendor} features to be toggled on and off.  Features that are off by default should be considered experimental functionality.
   resources.cattle.io.backup: A backup is created to perform one-time backups or schedule recurring backups based on a ResourceSet.
   resources.cattle.io.restore: A restore is created to trigger a restore to the cluster based on a backup file.
   resources.cattle.io.resourceset: A resource set defines which CRDs and resources to store in the backup.
@@ -4229,7 +4375,7 @@ typeDescription:
   catalog.cattle.io.app: An installed application is a Helm 3 chart that was installed either via our charts or through the Helm CLI.
   logging.banzaicloud.io.clusterflow: Logs from the cluster will be collected and logged to the selected Cluster Output.
   logging.banzaicloud.io.clusteroutput: A cluster output defines which logging providers that logs can be sent to and is only effective when deployed in the namespace that the logging operator is in.
-  logging.banzaicloud.io.flow: A flow defines which logs to collect and filter as well as which output to send the logs. The flow is a namespaced resource, which means logs will only be collected from the namepsace that the flow is deployed in.
+  logging.banzaicloud.io.flow: A flow defines which logs to collect and filter as well as which output to send the logs. The flow is a namespaced resource, which means logs will only be collected from the namespace that the flow is deployed in.
   logging.banzaicloud.io.output: An output defines which logging providers that logs can be sent to. The output needs to be in the same namespace as the flow that is using it.
   group.principal: Assigning global roles to a group only works with external auth providers that support groups. Local authorization does not support groups.
 
@@ -4484,7 +4630,7 @@ advancedSettings:
     'ui-dashboard-index': 'HTML index location for the {appName} UI.'
     'ui-offline-preferred': 'Controls whether UI assets are served locally by the server container or from the remote URL defined in the ui-index and ui-dashboard-index settings. The `Dynamic` option will use local assets in production builds of {appName}.'
     'ui-pl': 'Private-Label company name.'
-    'ui-issues': "Use a url address to send new 'File an Issue' reports instead of sending users to the Github issues page."
+    'ui-issues': "Use a url address to send new 'File an Issue' reports instead of sending users to the GitHub issues page."
     'telemetry-opt': 'Telemetry reporting opt-in.'
     'auth-user-info-max-age-seconds': 'The maximum age of a users auth tokens before an auth provider group membership sync will be performed.'
     'auth-user-info-resync-cron': 'Default cron schedule for resyncing auth provider group memberships.'
@@ -4516,7 +4662,7 @@ featureFlags:
   label: Feature Flags
   warning: |-
     Feature flags allow {vendor} to gate certain features behind flags.
-    Features that are off by defult shoud be considered experimental functionality.
+    Features that are off by default should be considered experimental functionality.
     Some features require a restart of the {vendor} server to change.
     This will result in a short outage of the API and UI, but not affect running clusters or workloads.
   restartRequired: "Note: Updating this feature flag requires a restart"
@@ -4584,6 +4730,77 @@ resourceQuota:
   resourceType:
     label: Resource Type
 
+snapshots:
+  title: Snapshots
+  action:
+    create: Create Snapshot
+  card:
+    created: "Created on '<b>'{date}'</b>' at '<b>'{time}'</b>'"
+    action:
+      restore: Restore
+      remove: Delete
+  create:
+    title: 'Create a new Snapshot'
+    name:
+      label: Snapshot Name
+    description:
+      label: Description
+    actions:
+      submit: Create
+      back: Cancel
+    info: 'Rancher Desktop will be temporarily unavailable while creating a new Snapshot'
+  empty:
+    icon: icon-search
+    heading: No snapshots found
+    body: Click on Create Snapshot to get started
+  dialog:
+    restore:
+      header: Restore snapshot?
+      info: 'Restoring this snapshot will replace your current installation, including preferences. If the Preferences window is open, it will be automatically closed and any unsaved changes will be discarded.'
+      actions:
+        ok: 'Restore'
+        cancel: 'Cancel'
+      error:
+        header: 'Error restoring snapshot'
+        description: "Failed to restore snapshot '<b>'{snapshot}'</b>'.'<br/><br/>'Rancher Desktop has performed a Factory Reset and will now exit. Please try to address the issue that led to this error before restarting Rancher Desktop and attempting to restore the snapshot again."
+        buttonText: 'Quit Rancher Desktop'
+    delete:
+      header: Permanently delete snapshot?
+      info: 'text'
+      actions:
+        ok: 'Delete'
+        cancel: 'Cancel'
+    restoring:
+      header: 'Restoring {snapshot}'
+      message: "Please wait while snapshot '<b>'{snapshot}'</b>' is being restored. This may take some time depending on your machine's resources.<br/><br/>Rancher Desktop will be temporarily unavailable during this operation. Once completed, the VM will restart with the {snapshot} snapshot active."
+      actions:
+        cancel: 'Cancel'
+    creating:
+      header: 'Creating {snapshot}'
+      message: "Please wait while snapshot '<b>'{snapshot}'</b>' is being created.'<br/>'This may take some time depending on your machine's resources.'<br/>'Rancher Desktop will be temporarily unavailable during this operation.'<br/><br/>'Once the snapshot is complete, the VM will restart."
+      actions:
+        cancel: 'Cancel'
+    buttons:
+      error: Close
+    generic:
+      header: Snapshot operation in progress
+      message: "Please wait while the snapshot operation is active.<br/>This may take some time depending on your machine's resources.<br/>Rancher Desktop will be temporarily unavailable during this operation.<br/><br/>Once the snapshot process is complete, the VM will restart."
+    showLogs: Show logs
+  info:
+    when: " at {time}"
+    restore:
+      success: "Restored '<b>'{snapshot}'</b>'"
+      cancel: 'Cancelled restoration of {snapshot}'
+    create:
+      success: "Created '<b>'{snapshot}'</b>'"
+      cancel: 'Cancelled creation of {snapshot}'
+    delete:
+      success: "Deleted '<b>'{snapshot}'</b>'"
+      error: 'Delete error: {error}'
+    lock:
+      info: "A snapshot lock file has been detected for an unusually long time. If you believe this is an error, you can try to remove the lock file by running <code>rdctl snapshot unlock</code>."
+
+
 ##############################
 ### Troubleshooting Page
 ##############################
@@ -4639,6 +4856,26 @@ diagnostics:
       heading: No problems detected
       body: Rancher Desktop appears to be functioning correctly.
 
+
+##############################
+### Extensions Page
+##############################
+extensions:
+  icon: icon-extension
+  installed:
+    list:
+      uninstall: Remove
+    emptyState:
+      icon: icon-extension
+      heading: No extensions installed
+      body: It looks like you don't have any extensions installed yet. Browse the extensions catalog to get started.
+      button:
+        text: Browse Extensions
+  view:
+    emptyState:
+      heading: Extension removed
+      body: '{extensionId} was removed. Please visit the extensions catalog to reinstall the extension or browse for other extensions to enhance your Rancher Desktop experience.'
+
 ##############################
 ### Preferences Page
 ##############################
@@ -4648,7 +4885,12 @@ preferences:
       reset: Kubernetes will reset after applying changes.
       restart: Kubernetes will restart after applying changes.
       error: "There's a problem with the preferences selection."
-
+  locked:
+    tooltip: Locked due to organization's policy
+  incompatibleTypeWarningPre: 'The option requires'
+  incompatibleTypeWarningPostSelected: 'to be selected.'
+  incompatibleTypeWarningPostDisabled: 'to be unselected.'
+  incompatiblePrefWarningOr: 'or'
 ##############################
 ### Integrations Page
 ##############################

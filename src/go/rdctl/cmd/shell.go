@@ -21,13 +21,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path"
-	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
 
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/directories"
+	p "github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/paths"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"golang.org/x/text/encoding/unicode"
@@ -70,20 +69,22 @@ func doShellCommand(cmd *cobra.Command, args []string) error {
 			// No further output wanted, so just exit with the desired status.
 			os.Exit(1)
 		}
-		args = append([]string{"--distribution", distroName}, args...)
+		args = append([]string{
+			"--distribution", distroName,
+			"--exec", "/usr/local/bin/wsl-exec"},
+			args...)
 	} else {
-		if err := directories.SetupLimaHome(); err != nil {
-			return err
-		}
-		execPath, err := os.Executable()
+		paths, err := p.GetPaths()
 		if err != nil {
 			return err
 		}
-		execPath, err = filepath.EvalSymlinks(execPath)
+		if err = directories.SetupLimaHome(paths.AppHome); err != nil {
+			return err
+		}
+		commandName, err = directories.GetLimactlPath()
 		if err != nil {
 			return err
 		}
-		commandName = path.Join(path.Dir(path.Dir(execPath)), "lima", "bin", "limactl")
 		if !checkLimaIsRunning(commandName) {
 			// No further output wanted, so just exit with the desired status.
 			os.Exit(1)

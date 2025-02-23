@@ -1,12 +1,12 @@
 <script lang="ts">
+
 import { shell } from 'electron';
 import Vue from 'vue';
-import { mapState } from 'vuex';
 
 export default Vue.extend({
   name:  'help',
   props: {
-    fixedUrl: {
+    url: {
       type:    String,
       default: null,
     },
@@ -14,20 +14,19 @@ export default Vue.extend({
       type:    String,
       default: null,
     },
-  },
-  computed: {
-    ...mapState('help', ['url']),
-    helpUrl(): string {
-      return this.fixedUrl ?? this.url;
-    },
-    tooltipContent(): string | null {
-      return this.helpUrl ? this.tooltip : null;
+    disabled: {
+      type:    Boolean,
+      default: false,
     },
   },
   methods: {
     openUrl() {
-      if (this.helpUrl) {
-        shell.openExternal(this.helpUrl);
+      if (!this.disabled) {
+        if (this.url) {
+          shell.openExternal(this.url);
+        } else {
+          this.$emit('open:url');
+        }
       }
     },
   },
@@ -36,24 +35,17 @@ export default Vue.extend({
 
 <template>
   <div class="help-button">
-    <button
+    <i
       v-tooltip="{
-        content: tooltipContent,
-        placement: 'right'
+        content: tooltip,
+        placement: 'left'
       }"
-      class="btn role-fab"
+      class="icon icon-question-mark"
       :class="{
-        disabled: !helpUrl
+        disabled
       }"
       @click="openUrl"
-    >
-      <span
-        class="icon icon-question-mark"
-        :class="{
-          disabled: !helpUrl
-        }"
-      />
-    </button>
+    />
   </div>
 </template>
 
@@ -62,23 +54,13 @@ export default Vue.extend({
   .help-button {
 
     .icon {
-      display: inline-block;
-      background-color: var(--primary);
-      color: var(--body-bg);
-      font-size: 1.3rem;
-      width: 1.4rem;
-      height: 1.4rem;
-      border-radius: 50%;
+      background: transparent;
+      color: var(--primary);
+      font-size: 1.4rem;
       cursor: pointer;
 
-      &:before{
-        padding-top: 5%;
-        padding-left: 2%;
-        display: block;
-      }
-
       &:hover {
-        background: var(--primary-hover-bg);
+        color: var(--primary-hover-bg);
       }
     }
 
@@ -87,21 +69,9 @@ export default Vue.extend({
       color: var(--body-text);
       opacity: 0.2;
       cursor: default;
-    }
 
-    // We make use of the term Floating Action Button (fab) here because the
-    // design of this button is reminiscent of floating actions buttons from
-    // Material Design
-    .role-fab {
-      all: revert;
-
-      border: 0;
-      padding: 0;
-      background: transparent;
-      transition: background 200ms;
-      border-radius: 50%;
-      &.disabled {
-        border: 0;
+      &:hover {
+        color: var(--body-text);
       }
     }
   }

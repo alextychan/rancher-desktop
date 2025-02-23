@@ -25,22 +25,34 @@ import path from 'path';
 import { expect, test } from '@playwright/test';
 import _ from 'lodash';
 import fetch, { RequestInit } from 'node-fetch';
-import { BrowserContext, ElectronApplication, Page, _electron } from 'playwright';
+import yaml from 'yaml';
 
 import { NavPage } from './pages/nav-page';
 import {
-  createDefaultSettings, kubectl, packageLogs, reportAsset, tool,
+  getAlternateSetting, kubectl, retry, startSlowerDesktop, teardown,
 } from './utils/TestUtils';
 
-import { ContainerEngine, Settings } from '@pkg/config/settings';
+import {
+  CacheMode,
+  ContainerEngine,
+  CURRENT_SETTINGS_VERSION,
+  defaultSettings,
+  MountType,
+  ProtocolVersion,
+  SecurityModel,
+  Settings,
+  VMType,
+} from '@pkg/config/settings';
+import { PathManagementStrategy } from '@pkg/integrations/pathManager';
 import { ServerState } from '@pkg/main/commandServer/httpCommandServer';
 import { spawnFile } from '@pkg/utils/childProcess';
 import paths from '@pkg/utils/paths';
 import { RecursivePartial } from '@pkg/utils/typeUtils';
 
+import type { ElectronApplication, Page } from '@playwright/test';
+
 test.describe('Command server', () => {
   let electronApp: ElectronApplication;
-  let context: BrowserContext;
   let serverState: ServerState;
   let page: Page;
   const ENOENTMessage = os.platform() === 'win32' ? 'The system cannot find the file specified' : 'no such file or directory';
@@ -97,51 +109,24 @@ test.describe('Command server', () => {
   }
 
   function verifySettingsKeys(settings: Record<string, any>) {
-    expect(new Set(['version', 'containerEngine', 'kubernetes', 'portForwarding', 'images', 'telemetry',
-      'updater', 'debug', 'pathManagementStrategy', 'diagnostics']))
+    expect(new Set(Object.keys(defaultSettings)))
       .toEqual(new Set(Object.keys(settings)));
   }
 
   test.describe.configure({ mode: 'serial' });
 
-  test.beforeAll(async() => {
-    createDefaultSettings();
-    electronApp = await _electron.launch({
-      args: [
-        appPath,
-        '--disable-gpu',
-        '--whitelisted-ips=',
-        // See pkg/rancher-desktop/utils/commandLine.ts before changing the next item.
-        '--disable-dev-shm-usage',
-        '--no-modal-dialogs',
-      ],
-      env: {
-        ...process.env,
-        RD_LOGS_DIR: reportAsset(__filename, 'log'),
-      },
-    });
-    context = electronApp.context();
-
-    await context.tracing.start({
-      screenshots: true,
-      snapshots:   true,
-    });
-    page = await electronApp.firstWindow();
+  test.beforeAll(async({ colorScheme }, testInfo) => {
+    [electronApp, page] = await startSlowerDesktop(testInfo, { kubernetes: { enabled: true } });
   });
 
-  test.afterAll(async() => {
-    await context.tracing.stop({ path: reportAsset(__filename) });
-    await packageLogs(__filename);
-    await electronApp.close();
-  });
+  test.afterAll(({ colorScheme }, testInfo) => teardown(electronApp, testInfo));
 
   test('should load Kubernetes API', async() => {
     const navPage = new NavPage(page);
 
     await navPage.progressBecomesReady();
-    await expect(navPage.progressBar).toBeHidden();
 
-    expect(await kubectl('cluster-info')).toContain('is running at');
+    expect(await retry(() => kubectl('cluster-info'))).toContain('is running at');
   });
 
   test('should emit connection information', async() => {
@@ -158,7 +143,7 @@ test.describe('Command server', () => {
   });
 
   test('should require authentication, settings request', async() => {
-    const url = `http://127.0.0.1:${ serverState.port }/v0/settings`;
+    const url = `http://127.0.0.1:${ serverState.port }/v1/settings`;
     const resp = await fetch(url);
 
     expect(resp).toEqual(expect.objectContaining({
@@ -168,7 +153,7 @@ test.describe('Command server', () => {
   });
 
   test('should emit CORS headers, settings request', async() => {
-    const resp = await doRequest('/v0/settings', '', 'OPTIONS');
+    const resp = await doRequest('/v1/settings', '', 'OPTIONS');
 
     expect({
       ...resp,
@@ -178,14 +163,14 @@ test.describe('Command server', () => {
       ok:      true,
       headers: expect.objectContaining({
         'access-control-allow-headers': 'Authorization',
-        'access-control-allow-methods': 'GET, PUT',
+        'access-control-allow-methods': 'GET, PUT, DELETE',
         'access-control-allow-origin':  '*',
       }),
     }));
   });
 
   test('should be able to get settings', async() => {
-    const resp = await doRequest('/v0/settings');
+    const resp = await doRequest('/v1/settings');
 
     expect({
       ...resp,
@@ -195,7 +180,7 @@ test.describe('Command server', () => {
       ok:      true,
       headers: expect.objectContaining({
         'access-control-allow-headers': 'Authorization',
-        'access-control-allow-methods': 'GET, PUT',
+        'access-control-allow-methods': 'GET, PUT, DELETE',
         'access-control-allow-origin':  '*',
       }),
     }));
@@ -203,10 +188,10 @@ test.describe('Command server', () => {
   });
 
   test('setting existing settings should be a no-op', async() => {
-    let resp = await doRequest('/v0/settings');
+    let resp = await doRequest('/v1/settings');
     const rawSettings = resp.body.read().toString();
 
-    resp = await doRequest('/v0/settings', rawSettings, 'PUT');
+    resp = await doRequest('/v1/settings', rawSettings, 'PUT');
     expect({
       ok:     resp.ok,
       status: resp.status,
@@ -219,27 +204,29 @@ test.describe('Command server', () => {
   });
 
   test('should not update values when the /settings payload has errors', async() => {
-    let resp = await doRequest('/v0/settings');
+    let resp = await doRequest('/v1/settings');
     const settings = await resp.json();
     const desiredEnabled = !settings.kubernetes.enabled;
-    const desiredEngine = settings.kubernetes.containerEngine === 'moby' ? 'containerd' : 'moby';
+    const desiredEngine = 'flip';
     const desiredVersion = /1.23.4/.test(settings.kubernetes.version) ? 'v1.19.1' : 'v1.23.4';
     const requestedSettings = _.merge({}, settings, {
-      kubernetes:
-        {
-          enabled:                    desiredEnabled,
-          containerEngine:            desiredEngine,
-          version:                    desiredVersion,
-          checkForExistingKimBuilder: !settings.kubernetes.checkForExistingKimBuilder, // not supported
-        },
+      version:         CURRENT_SETTINGS_VERSION,
+      containerEngine: {
+        name:          { desiredEngine },
+        allowedImages: { enabled: !settings.containerEngine.allowedImages.enabled },
+      },
+      kubernetes: {
+        enabled: desiredEnabled,
+        version: desiredVersion,
+      },
     });
-    const resp2 = await doRequest('/v0/settings', JSON.stringify(requestedSettings), 'PUT');
+    const resp2 = await doRequest('/v1/settings', JSON.stringify(requestedSettings), 'PUT');
 
     expect(resp2.ok).toBeFalsy();
     expect(resp2.status).toEqual(400);
 
     // Now verify that the specified values did not get updated.
-    resp = await doRequest('/v0/settings');
+    resp = await doRequest('/v1/settings');
     const refreshedSettings = await resp.json();
 
     expect(refreshedSettings).toEqual(settings);
@@ -247,41 +234,43 @@ test.describe('Command server', () => {
 
   test('should return multiple error messages, settings request', async() => {
     const newSettings: Record<string, any> = {
-      kubernetes: {
-        WSLIntegrations: "ceci n'est pas un objet",
-        stoinks:         'yikes!', // should be ignored
-        memoryInGB:      'carl',
-        containerEngine: { status: 'should be a scalar' },
+      version:     CURRENT_SETTINGS_VERSION,
+      application: {
+        stoinks:   'yikes!', // should be ignored
+        telemetry: { enabled: { oops: 15 } },
       },
-      portForwarding: 'bob',
-      telemetry:      { oops: 15 },
+      containerEngine: { name: { status: 'should be a scalar' } },
+      virtualMachine:  { memoryInGB: 'carl' },
+      WSL:             { integrations: "ceci n'est pas un objet" },
+      portForwarding:  'bob',
     };
-    const resp2 = await doRequest('/v0/settings', JSON.stringify(newSettings), 'PUT');
+    const resp2 = await doRequest('/v1/settings', JSON.stringify(newSettings), 'PUT');
 
     expect(resp2.ok).toBeFalsy();
     expect(resp2.status).toEqual(400);
     const body = resp2.body.read().toString();
     const expectedWSL = {
-      win32: "Proposed field kubernetes.WSLIntegrations should be an object, got <ceci n'est pas un objet>.",
-      lima:  "Changing field kubernetes.WSLIntegrations via the API isn't supported.",
+      win32: `Proposed field "WSL.integrations" should be an object, got <ceci n'est pas un objet>.`,
+      lima:  `Changing field "WSL.integrations" via the API isn't supported.`,
     }[os.platform() === 'win32' ? 'win32' : 'lima'];
     const expectedMemory = {
-      win32: "Changing field kubernetes.memoryInGB via the API isn't supported.",
-      lima:  'Invalid value for kubernetes.memoryInGB: <"carl">',
+      win32: `Changing field "virtualMachine.memoryInGB" via the API isn't supported.`,
+      lima:  `Invalid value for "virtualMachine.memoryInGB": <"carl">`,
     }[os.platform() === 'win32' ? 'win32' : 'lima'];
     const expectedLines = [
+      'errors in attempt to update settings:',
       expectedWSL,
       expectedMemory,
-      `Invalid value for kubernetes.containerEngine: <{"status":"should be a scalar"}>; must be 'containerd', 'docker', or 'moby'`,
-      'Setting portForwarding should wrap an inner object, but got <bob>.',
-      'Invalid value for telemetry: <{"oops":15}>',
+      `Invalid value for "containerEngine.name": <{\"status\":\"should be a scalar\"}>; must be one of ["containerd","moby","docker"]`,
+      'Setting "portForwarding" should wrap an inner object, but got <bob>.',
+      'Invalid value for "application.telemetry.enabled": <{"oops":15}>',
     ];
 
-    expect(body.split(/\r?\n/g)).toEqual(expect.arrayContaining(expectedLines));
+    expect(body.split(/\r?\n/g).sort()).toEqual(expect.arrayContaining(expectedLines.sort()));
   });
 
   test('should reject invalid JSON, settings request', async() => {
-    const resp = await doRequest('/v0/settings', '{"missing": "close-brace"', 'PUT');
+    const resp = await doRequest('/v1/settings', '{"missing": "close-brace"', 'PUT');
 
     expect(resp.ok).toBeFalsy();
     expect(resp.status).toEqual(400);
@@ -291,7 +280,7 @@ test.describe('Command server', () => {
   });
 
   test('should reject empty payload, settings request', async() => {
-    const resp = await doRequest('/v0/settings', '', 'PUT');
+    const resp = await doRequest('/v1/settings', '', 'PUT');
 
     expect(resp.ok).toBeFalsy();
     expect(resp.status).toEqual(400);
@@ -300,7 +289,7 @@ test.describe('Command server', () => {
     expect(body).toContain('no settings specified in the request');
   });
 
-  test('version-only path of a non-existent version should 404', async() => {
+  test('version-only path of a nonexistent version should 404', async() => {
     const resp = await doRequest('/v99bottlesofbeeronthewall');
 
     expect(resp.ok).toBeFalsy();
@@ -311,18 +300,53 @@ test.describe('Command server', () => {
   });
 
   test('should not restart on unrelated changes', async() => {
-    let resp = await doRequest('/v0/settings');
-    let telemetry = false;
+    let resp = await doRequest('/v1/settings');
 
     expect(resp.ok).toBeTruthy();
-    telemetry = (await resp.json() as Settings).telemetry;
-    resp = await doRequest('/v0/settings', JSON.stringify({ telemetry: !telemetry }), 'PUT');
+    const telemetry = (await resp.json() as Settings).application.telemetry.enabled;
+
+    resp = await doRequest('/v1/settings', JSON.stringify({ version: CURRENT_SETTINGS_VERSION, application: { telemetry: { enabled: !telemetry } } }), 'PUT');
     expect(resp.ok).toBeTruthy();
     await expect(resp.text()).resolves.toContain('no restart required');
   });
 
+  test('should complain about a missing version field', async() => {
+    let resp = await doRequest('/v1/settings');
+
+    expect(resp.ok).toBeTruthy();
+
+    const body: RecursivePartial<Settings> = await resp.json();
+
+    delete body.version;
+    if (body?.application?.telemetry) {
+      body.application.telemetry.enabled = !body.application.telemetry.enabled;
+    }
+    resp = await doRequest('/v1/settings', JSON.stringify(body), 'PUT');
+    expect(resp.ok).toBeFalsy();
+    await expect(resp.text()).resolves.toContain(`updating settings requires specifying an API version, but no version was specified`);
+  });
+
+  test('should complain about an invalid version field', async() => {
+    let resp = await doRequest('/v1/settings');
+
+    expect(resp.ok).toBeTruthy();
+
+    const body: RecursivePartial<Settings> = await resp.json();
+    const badVersion = 'not a number';
+
+    // Override typescript's checking so we can verify that the server rejects the
+    // invalid value for the `version` field.
+    body.version = badVersion as any;
+    if (body?.application?.telemetry) {
+      body.application.telemetry.enabled = !body.application.telemetry.enabled;
+    }
+    resp = await doRequest('/v1/settings', JSON.stringify(body), 'PUT');
+    expect(resp.ok).toBeFalsy();
+    await expect(resp.text()).resolves.toContain(`updating settings requires specifying an API version, but "${ badVersion }" is not a proper config version`);
+  });
+
   test('should require authentication, transient settings request', async() => {
-    const url = `http://127.0.0.1:${ serverState.port }/v0/transient_settings`;
+    const url = `http://127.0.0.1:${ serverState.port }/v1/transient_settings`;
     const resp = await fetch(url);
 
     expect(resp).toEqual(expect.objectContaining({
@@ -332,7 +356,7 @@ test.describe('Command server', () => {
   });
 
   test('should emit CORS headers, transient settings request', async() => {
-    const resp = await doRequest('/v0/transient_settings', '', 'OPTIONS');
+    const resp = await doRequest('/v1/transient_settings', '', 'OPTIONS');
 
     expect({
       ...resp,
@@ -342,14 +366,14 @@ test.describe('Command server', () => {
       ok:      true,
       headers: expect.objectContaining({
         'access-control-allow-headers': 'Authorization',
-        'access-control-allow-methods': 'GET, PUT',
+        'access-control-allow-methods': 'GET, PUT, DELETE',
         'access-control-allow-origin':  '*',
       }),
     }));
   });
 
   test('should be able to get transient settings', async() => {
-    const resp = await doRequest('/v0/transient_settings');
+    const resp = await doRequest('/v1/transient_settings');
 
     expect({
       ...resp,
@@ -359,7 +383,7 @@ test.describe('Command server', () => {
       ok:      true,
       headers: expect.objectContaining({
         'access-control-allow-headers': 'Authorization',
-        'access-control-allow-methods': 'GET, PUT',
+        'access-control-allow-methods': 'GET, PUT, DELETE',
         'access-control-allow-origin':  '*',
       }),
     }));
@@ -367,10 +391,10 @@ test.describe('Command server', () => {
   });
 
   test('setting existing transient settings should be a no-op', async() => {
-    let resp = await doRequest('/v0/transient_settings');
+    let resp = await doRequest('/v1/transient_settings');
     const rawSettings = resp.body.read().toString();
 
-    resp = await doRequest('/v0/transient_settings', rawSettings, 'PUT');
+    resp = await doRequest('/v1/transient_settings', rawSettings, 'PUT');
     expect({
       ok:     resp.ok,
       status: resp.status,
@@ -383,58 +407,58 @@ test.describe('Command server', () => {
   });
 
   test('should not update values when the /transient_settings navItem payload is invalid', async() => {
-    let resp = await doRequest('/v0/transient_settings');
+    let resp = await doRequest('/v1/transient_settings');
     const transientSettings = await resp.json();
 
     const requestedSettings = _.merge({}, transientSettings, { preferences: { navItem: { current: 'foo', bar: 'bar' } } });
-    const resp2 = await doRequest('/v0/transient_settings', JSON.stringify(requestedSettings), 'PUT');
+    const resp2 = await doRequest('/v1/transient_settings', JSON.stringify(requestedSettings), 'PUT');
 
     expect(resp2.ok).toBeFalsy();
     expect(resp2.status).toEqual(400);
 
     // Now verify that the specified values did not get updated.
-    resp = await doRequest('/v0/transient_settings');
+    resp = await doRequest('/v1/transient_settings');
     const refreshedSettings = await resp.json();
 
     expect(refreshedSettings).toEqual(transientSettings);
   });
 
   test('should not update values when the /transient_settings payload has invalid current navItem name', async() => {
-    let resp = await doRequest('/v0/transient_settings');
+    let resp = await doRequest('/v1/transient_settings');
     const transientSettings = await resp.json();
 
     const requestedSettings = _.merge({}, transientSettings, { preferences: { navItem: { current: 'foo' } } });
-    const resp2 = await doRequest('/v0/transient_settings', JSON.stringify(requestedSettings), 'PUT');
+    const resp2 = await doRequest('/v1/transient_settings', JSON.stringify(requestedSettings), 'PUT');
 
     expect(resp2.ok).toBeFalsy();
     expect(resp2.status).toEqual(400);
 
     // Now verify that the specified values did not get updated.
-    resp = await doRequest('/v0/transient_settings');
+    resp = await doRequest('/v1/transient_settings');
     const refreshedSettings = await resp.json();
 
     expect(refreshedSettings).toEqual(transientSettings);
   });
 
   test('should not update values when the /transient_settings payload has invalid sub-tabs for Application preference page', async() => {
-    let resp = await doRequest('/v0/transient_settings');
+    let resp = await doRequest('/v1/transient_settings');
     const transientSettings = await resp.json();
 
     const requestedSettings = _.merge({}, transientSettings, { preferences: { navItem: { current: 'Application', currentTabs: { Application: 'foo' } } } });
-    const resp2 = await doRequest('/v0/transient_settings', JSON.stringify(requestedSettings), 'PUT');
+    const resp2 = await doRequest('/v1/transient_settings', JSON.stringify(requestedSettings), 'PUT');
 
     expect(resp2.ok).toBeFalsy();
     expect(resp2.status).toEqual(400);
 
     // Now verify that the specified values did not get updated.
-    resp = await doRequest('/v0/transient_settings');
+    resp = await doRequest('/v1/transient_settings');
     const refreshedSettings = await resp.json();
 
     expect(refreshedSettings).toEqual(transientSettings);
   });
 
   test('should not update values when the /transient_settings payload has invalid sub-tabs for Container Engine preference page', async() => {
-    let resp = await doRequest('/v0/transient_settings');
+    let resp = await doRequest('/v1/transient_settings');
     const transientSettings = await resp.json();
 
     const requestedSettings = _.merge(
@@ -442,20 +466,20 @@ test.describe('Command server', () => {
       transientSettings,
       { preferences: { navItem: { currentTabs: { 'Container Engine': 'behavior' } } } },
     );
-    const resp2 = await doRequest('/v0/transient_settings', JSON.stringify(requestedSettings), 'PUT');
+    const resp2 = await doRequest('/v1/transient_settings', JSON.stringify(requestedSettings), 'PUT');
 
     expect(resp2.ok).toBeFalsy();
     expect(resp2.status).toEqual(400);
 
     // Now verify that the specified values did not get updated.
-    resp = await doRequest('/v0/transient_settings');
+    resp = await doRequest('/v1/transient_settings');
     const refreshedSettings = await resp.json();
 
     expect(refreshedSettings).toEqual(transientSettings);
   });
 
   test('should not update values when the /transient_settings payload contains sub-tabs for a page not supporting sub-tabs: WSL / Virtual Machine', async() => {
-    let resp = await doRequest('/v0/transient_settings');
+    let resp = await doRequest('/v1/transient_settings');
     const transientSettings = await resp.json();
 
     const requestedSettings = _.merge(
@@ -463,20 +487,20 @@ test.describe('Command server', () => {
       transientSettings,
       { preferences: { navItem: { currentTabs: { [process.platform === 'win32' ? 'WSL' : 'Virtual Machine']: 'behavior' } } } },
     );
-    const resp2 = await doRequest('/v0/transient_settings', JSON.stringify(requestedSettings), 'PUT');
+    const resp2 = await doRequest('/v1/transient_settings', JSON.stringify(requestedSettings), 'PUT');
 
     expect(resp2.ok).toBeFalsy();
     expect(resp2.status).toEqual(400);
 
     // Now verify that the specified values did not get updated.
-    resp = await doRequest('/v0/transient_settings');
+    resp = await doRequest('/v1/transient_settings');
     const refreshedSettings = await resp.json();
 
     expect(refreshedSettings).toEqual(transientSettings);
   });
 
   test('should not update values when the /transient_settings payload contains sub-tabs for a page not supporting sub-tabs: Kubernetes', async() => {
-    let resp = await doRequest('/v0/transient_settings');
+    let resp = await doRequest('/v1/transient_settings');
     const transientSettings = await resp.json();
 
     const requestedSettings = _.merge(
@@ -484,20 +508,20 @@ test.describe('Command server', () => {
       transientSettings,
       { preferences: { navItem: { currentTabs: { Kubernetes: 'behavior' } } } },
     );
-    const resp2 = await doRequest('/v0/transient_settings', JSON.stringify(requestedSettings), 'PUT');
+    const resp2 = await doRequest('/v1/transient_settings', JSON.stringify(requestedSettings), 'PUT');
 
     expect(resp2.ok).toBeFalsy();
     expect(resp2.status).toEqual(400);
 
     // Now verify that the specified values did not get updated.
-    resp = await doRequest('/v0/transient_settings');
+    resp = await doRequest('/v1/transient_settings');
     const refreshedSettings = await resp.json();
 
     expect(refreshedSettings).toEqual(transientSettings);
   });
 
   test('should reject invalid JSON, transient settings request', async() => {
-    const resp = await doRequest('/v0/transient_settings', '{"missing": "close-brace"', 'PUT');
+    const resp = await doRequest('/v1/transient_settings', '{"missing": "close-brace"', 'PUT');
 
     expect(resp.ok).toBeFalsy();
     expect(resp.status).toEqual(400);
@@ -507,13 +531,39 @@ test.describe('Command server', () => {
   });
 
   test('should reject empty payload, transient settings request', async() => {
-    const resp = await doRequest('/v0/transient_settings', '', 'PUT');
+    const resp = await doRequest('/v1/transient_settings', '', 'PUT');
 
     expect(resp.ok).toBeFalsy();
     expect(resp.status).toEqual(400);
     const body = resp.body.read().toString();
 
     expect(body).toContain('no settings specified in the request');
+  });
+
+  test.describe('v0 API', () => {
+    const endpoints = {
+      GET:  ['diagnostic_categories', 'diagnostic_checks', 'diagnostic_ids', 'settings', 'transient_settings'],
+      PUT:  ['factory_reset', 'propose_settings', 'settings', 'shutdown', 'transient_settings'],
+      POST: ['diagnostic_checks'],
+    };
+
+    test('should no longer work', async() => {
+      for (const method in endpoints) {
+        for (const endpoint of endpoints[method as 'GET'|'PUT']) {
+          const resp = await doRequest(`/v0/${ endpoint }`, '', method);
+
+          expect({
+            ok:     resp.ok,
+            status: resp.status,
+            body:   resp.body.read().toString(),
+          }).toEqual({
+            ok:     false,
+            status: 400,
+            body:   `Invalid version "/v0" for endpoint "${ method } /v0/${ endpoint }" - use "/v1/${ endpoint }"`,
+          });
+        }
+      }
+    });
   });
 
   test.describe('rdctl', () => {
@@ -544,7 +594,7 @@ test.describe('Command server', () => {
             stdout, stderr, error,
           }).toEqual({
             error:  expect.any(Error),
-            stderr: expect.stringContaining(`Error: open ${ configFilePath }: ${ ENOENTMessage }`),
+            stderr: expect.stringContaining(`Error: failed to get connection info: open ${ configFilePath }: ${ ENOENTMessage }`),
             stdout: '',
           });
           expect(stderr).not.toContain('Usage:');
@@ -571,13 +621,13 @@ test.describe('Command server', () => {
               stdout, stderr, error,
             }).toEqual({
               error:  expect.any(Error),
-              stderr: expect.stringContaining(`Error: open ${ configFilePath }: ${ ENOENTMessage }`),
+              stderr: expect.stringContaining(`Error: failed to get connection info: open ${ configFilePath }: ${ ENOENTMessage }`),
               stdout: '',
             });
             expect(stderr).not.toContain('Usage:');
           }
         });
-        test.describe('when a non-existent config file is specified', () => {
+        test.describe('when a nonexistent config file is specified', () => {
           test('it fails even when all parameters are specified', async() => {
             const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'rd-fake-docker'));
 
@@ -590,7 +640,7 @@ test.describe('Command server', () => {
                 stdout, stderr, error,
               }).toEqual({
                 error:  expect.any(Error),
-                stderr: expect.stringContaining(`Error: open ${ configFile }: ${ ENOENTMessage }`),
+                stderr: expect.stringContaining(`Error: failed to get connection info: open ${ configFile }: ${ ENOENTMessage }`),
                 stdout: '',
               });
               expect(stderr).not.toContain('Usage:');
@@ -615,7 +665,8 @@ test.describe('Command server', () => {
 
       verifySettingsKeys(settings);
 
-      const args = ['set', '--container-engine', settings.kubernetes.containerEngine,
+      const args = ['set',
+        '--container-engine', settings.containerEngine.name,
         `--kubernetes-enabled=${ !!settings.kubernetes.enabled }`,
         '--kubernetes-version', settings.kubernetes.version];
       const result = await rdctl(args);
@@ -627,6 +678,39 @@ test.describe('Command server', () => {
     });
 
     test.describe('set', () => {
+      const unsupportedPrefsByPlatform: {[x in NodeJS.Platform] ?: [string, any][]} = {
+        win32: [
+          ['application.admin-access', true],
+          ['application.path-management-strategy', 'rcfiles'],
+          ['experimental.virtual-machine.mount.9p.cache-mode', CacheMode.MMAP],
+          ['experimental.virtual-machine.mount.9p.msize-in-kib', 128],
+          ['experimental.virtual-machine.mount.9p.protocol-version', ProtocolVersion.NINEP2000_L],
+          ['experimental.virtual-machine.mount.9p.security-model', SecurityModel.NONE],
+          ['experimental.virtual-machine.mount.type', MountType.NINEP],
+          ['experimental.virtual-machine.use-rosetta', true],
+          ['experimental.virtual-machine.type', VMType.VZ],
+          ['virtual-machine.memory-in-gb', 10],
+          ['virtual-machine.number-cpus', 10],
+        ],
+        darwin: [
+          ['kubernetes.ingress.localhost-only', true],
+        ],
+        linux: [
+          ['experimental.virtual-machine.use-rosetta', true],
+          ['experimental.virtual-machine.type', VMType.VZ],
+          ['experimental.virtual-machine.proxy.enabled', true],
+        ],
+      };
+      const unsupportedOptions = unsupportedPrefsByPlatform[os.platform()] ?? [];
+      const commonOptions = [
+        'container-engine.name',
+        'container-engine.allowed-images.enabled',
+        'kubernetes.version',
+        'kubernetes.port',
+        'kubernetes.options.traefik',
+        'port-forwarding.include-kubernetes-services',
+      ];
+
       test('complains when no args are given', async() => {
         const { stdout, stderr, error } = await rdctl(['set']);
 
@@ -638,6 +722,19 @@ test.describe('Command server', () => {
           stdout: '',
         });
         expect(stderr).toContain('Usage:');
+        const options = stderr.split(/\n/)
+          .filter(line => /^\s+--/.test(line))
+          .map(line => (/\s+--([-.\w]+)\s/.exec(line) || [])[1])
+          .filter(line => line);
+
+        // This part is a bit subtle
+        // Require that the received options contain at least all the common options
+        expect(options).toEqual(expect.arrayContaining(commonOptions));
+        // We can't use `not.toEqual.arrayContaining` for the unsupported options because if the received
+        // list contains some but not all of the unsupported options the not-test will still succeed
+        for (const option of unsupportedOptions) {
+          expect(options).not.toContain(option[0]);
+        }
       });
 
       test('complains when option value missing', async() => {
@@ -674,10 +771,10 @@ test.describe('Command server', () => {
           stdout, stderr, error,
         }).toEqual({
           error:  expect.any(Error),
-          stderr: expect.stringContaining(`Invalid value for kubernetes.containerEngine: <"${ myEngine }">; must be 'containerd', 'docker', or 'moby'`),
+          stderr: expect.stringContaining(`Error: invalid value for option --container-engine: "${ myEngine }"; must be 'containerd', 'docker', or 'moby'`),
           stdout: '',
         });
-        expect(stderr).toContain('Error: errors in attempt to update settings:');
+        expect(stderr).not.toContain('Error: errors in attempt to update settings:');
         expect(stderr).not.toContain('Usage:');
       });
 
@@ -692,6 +789,122 @@ test.describe('Command server', () => {
           stdout: '',
         });
         expect(stderr).not.toContain('Usage:');
+      });
+
+      test.describe('settings v5 migration', () => {
+        /**
+         * Note issue https://github.com/rancher-sandbox/rancher-desktop/issues/3829
+         * calls for removing unrecognized fields in the existing settings.json file
+         * Currently we're ignoring unrecognized fields in the PUT payload -- to complain about
+         * them calls for another issue.
+         */
+        test('rejects old settings', async() => {
+          const oldSettings: Settings = JSON.parse((await rdctl(['list-settings'])).stdout);
+          const body: any = {
+            // type 'any' because as far as the current configuration code is concerned,
+            // it's an object with random fields and values
+            version:    CURRENT_SETTINGS_VERSION,
+            kubernetes: {
+              memoryInGB:      oldSettings.virtualMachine.memoryInGB + 1,
+              numberCPUs:      oldSettings.virtualMachine.numberCPUs + 1,
+              containerEngine: getAlternateSetting(oldSettings, 'containerEngine.name', ContainerEngine.CONTAINERD, ContainerEngine.MOBY),
+              suppressSudo:    oldSettings.application.adminAccess,
+            },
+            telemetry: !oldSettings.application.telemetry.enabled,
+            updater:   !oldSettings.application.updater.enabled,
+            debug:     !oldSettings.application.debug,
+          };
+          const addPathManagementStrategy = (oldSettings: Settings, body: any) => {
+            body.pathManagementStrategy = getAlternateSetting(oldSettings,
+              'application.pathManagementStrategy',
+              PathManagementStrategy.Manual,
+              PathManagementStrategy.RcFiles);
+          };
+
+          switch (os.platform()) {
+          case 'darwin':
+            body.kubernetes.experimental ??= {};
+            addPathManagementStrategy(oldSettings, body);
+            break;
+          case 'linux':
+            addPathManagementStrategy(oldSettings, body);
+            break;
+          case 'win32':
+            body.kubernetes.WSLIntegrations ??= {};
+            body.kubernetes.WSLIntegrations.bosco = true;
+          }
+          const { stdout, stderr, error } = await rdctl(['api', '/v1/settings', '-X', 'PUT', '-b', JSON.stringify(body)]);
+
+          expect({
+            stdout, stderr, error,
+          }).toEqual({
+            stdout: expect.stringContaining('no changes necessary'),
+            stderr: '',
+            error:  undefined,
+          });
+          const newSettings: Settings = JSON.parse((await rdctl(['list-settings'])).stdout);
+
+          expect(newSettings).toEqual(oldSettings);
+        });
+
+        test('accepts new settings', async() => {
+          const oldSettings: Settings = JSON.parse((await rdctl(['list-settings'])).stdout);
+          const body: RecursivePartial<Settings> = {
+            ...(os.platform() === 'win32' ? {} : {
+              virtualMachine: {
+                memoryInGB: oldSettings.virtualMachine.memoryInGB + 1,
+                numberCPUs: oldSettings.virtualMachine.numberCPUs + 1,
+              },
+            }),
+            version:     CURRENT_SETTINGS_VERSION,
+            application: {
+              // XXX: Can't change adminAccess until we can process the sudo-request dialog (and decline it)
+              // adminAccess: !oldSettings.application.adminAccess,
+              telemetry: { enabled: !oldSettings.application.telemetry.enabled },
+              updater:   { enabled: !oldSettings.application.updater.enabled },
+              debug:     !oldSettings.application.debug,
+            },
+            // This field is to force a restart
+            kubernetes: { port: oldSettings.kubernetes.port + 1 },
+          };
+
+          if (process.platform !== 'win32' && body.application !== undefined) {
+            body.application.pathManagementStrategy = getAlternateSetting(oldSettings,
+              'application.pathManagementStrategy',
+              PathManagementStrategy.Manual,
+              PathManagementStrategy.RcFiles);
+          }
+          const { stdout, stderr, error } = await rdctl(['api', '/v1/settings', '-X', 'PUT', '-b', JSON.stringify(body)]);
+
+          expect({
+            stdout, stderr, error,
+          }).toEqual({
+            stdout: expect.stringContaining('reconfiguring Rancher Desktop to apply changes'),
+            stderr: '',
+            error:  undefined,
+          });
+          const newSettings: Settings = JSON.parse((await rdctl(['list-settings'])).stdout);
+
+          expect(newSettings).toEqual(_.merge(oldSettings, body));
+
+          // And now reinstate the old prefs so other tests that count on them will pass.
+          const result = await rdctl(['api', '/v1/settings', '-X', 'PUT', '-b', JSON.stringify(oldSettings)]);
+
+          expect(result.stderr).toEqual('');
+          const navPage = new NavPage(page);
+
+          await navPage.progressBecomesReady();
+        });
+      });
+
+      test('complains about options not intended for current platform', async() => {
+        // playwright doesn't support test.each
+        // See https://github.com/microsoft/playwright/issues/7036 for the discussion
+
+        for (const [option, newValue] of unsupportedOptions) {
+          await expect(rdctl(['set', `--${ option }=${ newValue }`])).resolves
+            .toMatchObject({ stderr: expect.stringContaining(`Error: option --${ option } is not available on`) });
+        }
       });
     });
 
@@ -717,7 +930,7 @@ test.describe('Command server', () => {
         }
       });
 
-      test.describe('complains when unrecognized option are given', () => {
+      test.describe('complains when unrecognized options are given', () => {
         for (const cmd of ['set', 'list-settings', 'shutdown']) {
           const args = [cmd, '--Awop-bop-a-loo-mop', 'zips', '--alop-bom-bom=cows'];
 
@@ -766,7 +979,7 @@ test.describe('Command server', () => {
         });
 
         test('complains when more than one endpoint is given', async() => {
-          const endpoints = ['settings', '/v0/settings'];
+          const endpoints = ['settings', '/v1/settings'];
           const { stdout, stderr, error } = await rdctl(['api', ...endpoints]);
 
           expect({
@@ -783,7 +996,7 @@ test.describe('Command server', () => {
       test.describe('settings', () => {
         test.describe('options:', () => {
           test.describe('GET', () => {
-            for (const endpoint of ['settings', '/v0/settings']) {
+            for (const endpoint of ['settings', '/v1/settings']) {
               for (const methodSpecs of [[], ['-X', 'GET'], ['--method', 'GET']]) {
                 const args = ['api', endpoint, ...methodSpecs];
 
@@ -807,7 +1020,7 @@ test.describe('Command server', () => {
             test.describe('from stdin', () => {
               const settingsFile = path.join(paths.config, 'settings.json');
 
-              for (const endpoint of ['settings', '/v0/settings']) {
+              for (const endpoint of ['settings', '/v1/settings']) {
                 for (const methodSpec of ['-X', '--method']) {
                   for (const inputSpec of [['--input', '-'], ['--input=-']]) {
                     const args = ['api', endpoint, methodSpec, 'PUT', ...inputSpec];
@@ -820,7 +1033,7 @@ test.describe('Command server', () => {
                       }).toEqual({
                         error:  undefined,
                         stderr: '',
-                        stdout: expect.stringContaining('no changes necessary'),
+                        stdout: expect.not.stringContaining('apply'),
                       });
                     });
                   }
@@ -830,7 +1043,7 @@ test.describe('Command server', () => {
             test.describe('--input', () => {
               const settingsFile = path.join(paths.config, 'settings.json');
 
-              for (const endpoint of ['settings', '/v0/settings']) {
+              for (const endpoint of ['settings', '/v1/settings']) {
                 for (const methodSpecs of [['-X', 'PUT'], ['--method', 'PUT'], []]) {
                   for (const inputSource of [['--input', settingsFile], [`--input=${ settingsFile }`]]) {
                     const args = ['api', endpoint, ...methodSpecs, ...inputSource];
@@ -867,7 +1080,7 @@ test.describe('Command server', () => {
             test.describe('from body', () => {
               const settingsFile = path.join(paths.config, 'settings.json');
 
-              for (const endpoint of ['settings', '/v0/settings']) {
+              for (const endpoint of ['settings', '/v1/settings']) {
                 for (const methodSpecs of [[], ['-X', 'PUT'], ['--method', 'PUT']]) {
                   for (const inputOption of ['--body', '-b']) {
                     const args = ['api', endpoint, ...methodSpecs, inputOption];
@@ -923,14 +1136,14 @@ test.describe('Command server', () => {
             });
 
             test('invalid setting is specified', async() => {
-              const newSettings = { kubernetes: { containerEngine: 'beefalo' } };
+              const newSettings = { version: CURRENT_SETTINGS_VERSION, containerEngine: { name: 'beefalo' } };
               const { stdout, stderr, error } = await rdctl(['api', 'settings', '-b', JSON.stringify(newSettings)]);
 
               expect({
                 stdout, stderr, error,
               }).toEqual({
                 error:  expect.any(Error),
-                stderr: expect.stringMatching(/errors in attempt to update settings:\s+Invalid value for kubernetes.containerEngine: <"beefalo">; must be 'containerd', 'docker', or 'moby'/),
+                stderr: expect.stringMatching(/errors in attempt to update settings:\s+Invalid value for "containerEngine.name": <"beefalo">; must be one of \["containerd","moby","docker"\]/),
                 stdout: expect.stringMatching(/{.*}/s),
               });
               expect(stderr).not.toContain('Usage:');
@@ -955,51 +1168,63 @@ test.describe('Command server', () => {
         expect(stderr).not.toContain('Usage:');
       });
 
+      test('complains on invalid unversioned endpoint', async() => {
+        const endpoint = '/v1/shazbat';
+        const { stdout, stderr, error } = await rdctl(['api', endpoint]);
+
+        expect({
+          stdout, stderr, error,
+        }).toEqual({
+          error:  expect.any(Error),
+          stderr: expect.stringContaining(`Unknown command: GET ${ endpoint }`),
+          stdout: expect.stringMatching(/{".+?":".+"}/),
+        });
+        expect(JSON.parse(stdout)).toEqual({ message: '404 Not Found' });
+        expect(stderr).not.toContain('Usage:');
+      });
+
       test.describe('getting endpoints', () => {
+        async function getEndpoints() {
+          const apiSpecPath = path.join(path.dirname(__filename), '../pkg/rancher-desktop/assets/specs/command-api.yaml');
+          const apiSpec = await fs.promises.readFile(apiSpecPath, 'utf-8');
+          const specPaths = yaml.parse(apiSpec).paths;
+
+          return Object.entries<Record<string, unknown>>(specPaths)
+            .flatMap(([path, data]) => Object.keys(data).map(method => [path, method]))
+            .sort();
+        }
+
         test('no paths should return all supported endpoints', async() => {
           const { stdout, stderr } = await rdctl(['api', '/']);
+          const endpoints = (await getEndpoints())
+            .map(([path, method]) => `${ method.toUpperCase() } ${ path }`);
 
           expect(stderr).toEqual('');
-          expect(JSON.parse(stdout)).toEqual([
-            'GET /',
-            'GET /v0',
-            'GET /v0/diagnostic_categories',
-            'GET /v0/diagnostic_checks',
-            'POST /v0/diagnostic_checks',
-            'GET /v0/diagnostic_ids',
-            'PUT /v0/factory_reset',
-            'PUT /v0/propose_settings',
-            'GET /v0/settings',
-            'PUT /v0/settings',
-            'PUT /v0/shutdown',
-            'GET /v0/transient_settings',
-            'PUT /v0/transient_settings',
-          ]);
+          expect(JSON.parse(stdout).sort()).toEqual(endpoints.sort());
         });
 
-        test('version-only path should return all endpoints in that version only', async() => {
+        test('version-only path for v0 should return only itself', async() => {
           const { stdout, stderr } = await rdctl(['api', '/v0']);
 
           expect(stderr).toEqual('');
           expect(JSON.parse(stdout)).toEqual([
             'GET /v0',
-            'GET /v0/diagnostic_categories',
-            'GET /v0/diagnostic_checks',
-            'POST /v0/diagnostic_checks',
-            'GET /v0/diagnostic_ids',
-            'PUT /v0/factory_reset',
-            'PUT /v0/propose_settings',
-            'GET /v0/settings',
-            'PUT /v0/settings',
-            'PUT /v0/shutdown',
-            'GET /v0/transient_settings',
-            'PUT /v0/transient_settings',
           ]);
         });
-        test('/v1 should fail', async() => {
-          const { stdout, stderr } = await rdctl(['api', '/v1']);
 
-          expect({ stdout: JSON.parse(stdout), stderr: stderr.trim() }).toMatchObject({ stdout: { message: '404 Not Found' }, stderr: 'Unknown command: GET /v1' });
+        test('version-only path for v1 should return all endpoints in that version only', async() => {
+          const { stdout, stderr } = await rdctl(['api', '/v1']);
+          const endpoints = (await getEndpoints())
+            .filter(([path]) => path.startsWith('/v1'))
+            .map(([path, method]) => `${ method.toUpperCase() } ${ path }`);
+
+          expect(stderr).toEqual('');
+          expect(JSON.parse(stdout).sort()).toEqual(endpoints.sort());
+        });
+        test('/v2 should fail', async() => {
+          const { stdout, stderr } = await rdctl(['api', '/v2']);
+
+          expect({ stdout: JSON.parse(stdout), stderr: stderr.trim() }).toMatchObject({ stdout: { message: '404 Not Found' }, stderr: 'Unknown command: GET /v2' });
         });
       });
 
@@ -1007,31 +1232,31 @@ test.describe('Command server', () => {
         let categories: string[];
 
         test('categories', async() => {
-          const { stdout, stderr } = await rdctl(['api', '/v0/diagnostic_categories']);
+          const { stdout, stderr } = await rdctl(['api', '/v1/diagnostic_categories']);
 
           expect(stderr).toEqual('');
           categories = JSON.parse(stdout);
           expect(categories).toEqual(expect.arrayContaining(['Networking']));
         });
         test.skip('it finds the IDs for Utilities', async() => {
-          const { stdout, stderr } = await rdctl(['api', '/v0/diagnostic_ids?category=Utilities']);
+          const { stdout, stderr } = await rdctl(['api', '/v1/diagnostic_ids?category=Utilities']);
 
           expect(stderr).toEqual('');
           expect(JSON.parse(stdout)).toEqual(expect.arrayContaining(['RD_BIN_IN_BASH_PATH', 'RD_BIN_SYMLINKS']));
         });
         test('it finds the IDs for Networking', async() => {
-          const { stdout, stderr } = await rdctl(['api', '/v0/diagnostic_ids?category=Networking']);
+          const { stdout, stderr } = await rdctl(['api', '/v1/diagnostic_ids?category=Networking']);
 
           expect(stderr).toEqual('');
           expect(JSON.parse(stdout)).toEqual(expect.arrayContaining(['CONNECTED_TO_INTERNET']));
         });
-        test('it 404s for a non-existent category', async() => {
-          const { stdout, stderr } = await rdctl(['api', '/v0/diagnostic_ids?category=cecinestpasuncategory']);
+        test('it 404s for a nonexistent category', async() => {
+          const { stdout, stderr } = await rdctl(['api', '/v1/diagnostic_ids?category=cecinestpasuncategory']);
 
           expect({ stdout: JSON.parse(stdout), stderr: stderr.trim() }).toMatchObject({ stdout: { message: '404 Not Found' }, stderr: 'No diagnostic checks found in category cecinestpasuncategory' });
         });
         test('it finds a diagnostic check', async() => {
-          const { stdout, stderr } = await rdctl(['api', '/v0/diagnostic_checks?category=Networking&id=CONNECTED_TO_INTERNET']);
+          const { stdout, stderr } = await rdctl(['api', '/v1/diagnostic_checks?category=Networking&id=CONNECTED_TO_INTERNET']);
 
           expect(stderr).toEqual('');
           expect(JSON.parse(stdout)).toMatchObject({
@@ -1043,7 +1268,7 @@ test.describe('Command server', () => {
           });
         });
         test('it finds all diagnostic checks', async() => {
-          const { stdout, stderr } = await rdctl(['api', '/v0/diagnostic_checks']);
+          const { stdout, stderr } = await rdctl(['api', '/v1/diagnostic_checks']);
 
           expect(stderr).toEqual('');
           expect(JSON.parse(stdout)).toMatchObject({
@@ -1060,7 +1285,7 @@ test.describe('Command server', () => {
           });
         });
         test.skip('it finds all diagnostic checks for a category', async() => {
-          const { stdout, stderr } = await rdctl(['api', '/v0/diagnostic_checks?category=Utilities']);
+          const { stdout, stderr } = await rdctl(['api', '/v1/diagnostic_checks?category=Utilities']);
 
           expect(stderr).toEqual('');
           expect(JSON.parse(stdout)).toEqual({
@@ -1087,7 +1312,7 @@ test.describe('Command server', () => {
           });
         });
         test('it finds a diagnostic check by checkID', async() => {
-          const { stdout, stderr } = await rdctl(['api', '/v0/diagnostic_checks?id=CONNECTED_TO_INTERNET']);
+          const { stdout, stderr } = await rdctl(['api', '/v1/diagnostic_checks?id=CONNECTED_TO_INTERNET']);
 
           expect(stderr).toEqual('');
           expect(JSON.parse(stdout)).toMatchObject({
@@ -1101,25 +1326,34 @@ test.describe('Command server', () => {
             ],
           });
         });
-        test('it returns an empty array for a non-existent category', async() => {
-          const { stdout, stderr } = await rdctl(['api', '/v0/diagnostic_checks?category=not*a*category']);
+        test('it returns an empty array for a nonexistent category', async() => {
+          const { stdout, stderr } = await rdctl(['api', '/v1/diagnostic_checks?category=not*a*category']);
 
           expect({ stdout: JSON.parse(stdout), stderr } ).toMatchObject({ stdout: { checks: [] }, stderr: '' });
         });
-        test('it returns an empty array for a non-existent category with a valid ID', async() => {
-          const { stdout, stderr } = await rdctl(['api', '/v0/diagnostic_checks?category=not*a*category&id=CONNECTED_TO_INTERNET']);
+        test('it returns an empty array for a nonexistent category with a valid ID', async() => {
+          const { stdout, stderr } = await rdctl(['api', '/v1/diagnostic_checks?category=not*a*category&id=CONNECTED_TO_INTERNET']);
 
           expect({ stdout: JSON.parse(stdout), stderr } ).toMatchObject({ stdout: { checks: [] }, stderr: '' });
         });
-        test('it returns an empty array for a non-existent checkID with a valid category', async() => {
-          const { stdout, stderr } = await rdctl(['api', '/v0/diagnostic_checks?category=Utilities&id=CONNECTED_TO_INTERNET']);
+        test('it returns an empty array for a nonexistent checkID with a valid category', async() => {
+          const { stdout, stderr } = await rdctl(['api', '/v1/diagnostic_checks?category=Utilities&id=CONNECTED_TO_INTERNET']);
 
           expect({ stdout: JSON.parse(stdout), stderr } ).toMatchObject({ stdout: { checks: [] }, stderr: '' });
         });
-        test('it returns an empty array for a non-existent checkID when no category is specified', async() => {
-          const { stdout, stderr } = await rdctl(['api', '/v0/diagnostic_checks?&id=blip']);
+        test('it returns an empty array for a nonexistent checkID when no category is specified', async() => {
+          const { stdout, stderr } = await rdctl(['api', '/v1/diagnostic_checks?&id=blip']);
 
           expect({ stdout: JSON.parse(stdout), stderr } ).toMatchObject({ stdout: { checks: [] }, stderr: '' });
+        });
+      });
+
+      test.describe('other endpoints', () => {
+        test('it can find the about text', async() => {
+          const { stdout, stderr } = await rdctl(['api', '/v1/about']);
+
+          expect(stderr).toEqual('');
+          expect(stdout).toMatch(/\w+/);
         });
       });
     });
@@ -1167,38 +1401,6 @@ test.describe('Command server', () => {
         }
       });
     });
-    test('should verify nerdctl can talk to containerd', async() => {
-      const { stdout } = await rdctl(['list-settings']);
-      const settings: Settings = JSON.parse(stdout);
-      const payloadObject: RecursivePartial<Settings> = { };
-
-      if (settings.kubernetes.containerEngine !== ContainerEngine.CONTAINERD) {
-        payloadObject.kubernetes = {};
-        payloadObject.kubernetes.containerEngine = ContainerEngine.CONTAINERD;
-      }
-      if (Object.keys(payloadObject).length > 0) {
-        const navPage = new NavPage(page);
-
-        await tool('rdctl', 'api', '/v0/settings', '--method', 'PUT', '--body', JSON.stringify(payloadObject));
-        await expect(navPage.progressBar).not.toBeHidden();
-        await navPage.progressBecomesReady();
-        await expect(navPage.progressBar).toBeHidden();
-      }
-      const output = await tool('nerdctl', 'info');
-
-      expect(output).toMatch(/Server Version:\s+v?[.0-9]+/);
-    });
-    test('should verify docker can talk to dockerd', async() => {
-      const navPage = new NavPage(page);
-
-      await tool('rdctl', 'set', '--container-engine', 'moby');
-      await expect(navPage.progressBar).not.toBeHidden();
-      await navPage.progressBecomesReady();
-      await expect(navPage.progressBar).toBeHidden();
-      const output = await tool('docker', 'info');
-
-      expect(output).toMatch(/Server Version:\s+v?[.0-9]+/);
-    });
   });
 
   // Where is the test that pushes a supported update, you may be wondering?
@@ -1209,5 +1411,5 @@ test.describe('Command server', () => {
 
   // There's also no test checking for oversize-payload detection because when I try to create a
   // payload > 2000 characters I get this error:
-  // FetchError: request to http://127.0.0.1:6107/v0/set failed, reason: socket hang up
+  // FetchError: request to http://127.0.0.1:6107/v1/set failed, reason: socket hang up
 });

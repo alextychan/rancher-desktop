@@ -1,16 +1,19 @@
 package main
 
 import (
+	"bytes"
+	"encoding/csv"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
 func spawn(opts spawnOptions) error {
-	args := []string{"--distribution", opts.distro, "--exec", opts.nerdctl, "--address", opts.containerdSocket}
+	args := []string{"--distribution", opts.distro, "--exec", "/usr/local/bin/wsl-exec", opts.nerdctl, "--address", opts.containerdSocket}
 	args = append(args, opts.args.args...)
 	cmd := exec.Command("wsl.exe", args...)
 	cmd.Stdin = os.Stdin
@@ -57,7 +60,7 @@ func pathToWSL(arg string) (string, error) {
 	}
 	slashPath := filepath.ToSlash(absPath)
 	vol := filepath.VolumeName(absPath)
-	if len(vol) > 0 && vol[len(vol)-1] == ':' {
+	if vol != "" && vol[len(vol)-1] == ':' {
 		volName := strings.ToLower(vol[:len(vol)-1])
 		return "/mnt/" + volName + slashPath[len(vol):], nil
 	}
@@ -83,55 +86,20 @@ func volumeArgHandler(arg string) (string, []cleanupFunc, error) {
 	// For now, assume the container path doesn't contain colons.
 	colonIndex := strings.LastIndex(cleanArg, ":")
 	if colonIndex < 0 {
-		return "", nil, fmt.Errorf("Invalid volume mount: %s does not contain : separator", arg)
+		return "", nil, fmt.Errorf("invalid volume mount: %s does not contain : separator", arg)
 	}
 	hostPath := cleanArg[:colonIndex]
 	containerPath := cleanArg[colonIndex+1:]
 	wslHostPath, err := pathToWSL(hostPath)
 	if err != nil {
-		return "", nil, fmt.Errorf("Could not get volume host path for %s: %w", arg, err)
+		return "", nil, fmt.Errorf("could not get volume host path for %s: %w", arg, err)
 	}
 	return wslHostPath + ":" + containerPath + readWrite, nil, nil
 }
 
 // mountArgHandler handles the argument for `nerdctl run --mount=...`
 func mountArgHandler(arg string) (string, []cleanupFunc, error) {
-	var chunks [][]string
-	isBind := false
-	for _, chunk := range strings.Split(arg, ",") {
-		parts := strings.SplitN(chunk, "=", 2)
-		if len(parts) != 2 {
-			// Got something with no value, e.g. --mount=...,readonly,...
-			chunks = append(chunks, []string{chunk})
-			continue
-		}
-		if parts[0] == "type" && parts[1] == "bind" {
-			isBind = true
-		}
-		chunks = append(chunks, parts)
-	}
-	if !isBind {
-		// Not a bind mount; don't attempt to fix anything
-		return arg, nil, nil
-	}
-	for _, chunk := range chunks {
-		if len(chunk) != 2 {
-			continue
-		}
-		if chunk[0] != "source" && chunk[0] != "src" {
-			continue
-		}
-		fixedPath, err := pathToWSL(chunk[1])
-		if err != nil {
-			return arg, nil, fmt.Errorf("could not parse %s: %w", arg, err)
-		}
-		chunk[1] = fixedPath
-	}
-	result := ""
-	for _, chunk := range chunks {
-		result = fmt.Sprintf("%s,%s", result, strings.Join(chunk, "="))
-	}
-	return result[1:], nil, nil // Skip the initial "," we added
+	return mountArgProcessor(arg, pathToWSL)
 }
 
 // filePathArgHandler handles arguments that take a file path for input
@@ -151,4 +119,62 @@ func outputPathArgHandler(arg string) (string, []cleanupFunc, error) {
 		return "", nil, err
 	}
 	return result, nil, nil
+}
+
+// builderCacheArgHandler handles arguments for
+// `nerdctl builder build --cache-from=` and `nerdctl builder build --cache-to=`
+func builderCacheArgHandler(arg string) (string, []cleanupFunc, error) {
+	return builderCacheProcessor(arg, filePathArgHandler, outputPathArgHandler)
+}
+
+// buildContextArgHandler handles arguments for
+// `nerdctl builder build --build-context=`.
+func buildContextArgHandler(arg string) (string, []cleanupFunc, error) {
+	// The arg must be parsed as CSV (!?), and then split on `=` for key-value
+	// pairs; for each value, it is either a URN with a prefix of one of
+	// `urnPrefixes`, or it's a filesystem path.
+
+	urnPrefixes := []string{"https://", "http://", "docker-image://", "target:", "oci-layout://"}
+	parts, err := csv.NewReader(strings.NewReader(arg)).Read()
+	if err != nil {
+		return "", nil, err
+	}
+	var resultParts []string
+	for _, part := range parts {
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			return "", nil, fmt.Errorf("failed to parse context value %q (expected key=value)", part)
+		}
+		k, v := kv[0], kv[1]
+		matchesPrefix := func(prefix string) bool {
+			return strings.HasPrefix(v, prefix)
+		}
+		if !slices.ContainsFunc(urnPrefixes, matchesPrefix) {
+			v, err = pathToWSL(v)
+			if err != nil {
+				return "", nil, err
+			}
+		}
+		resultParts = append(resultParts, fmt.Sprintf("%s=%s", k, v))
+	}
+	var result bytes.Buffer
+	writer := csv.NewWriter(&result)
+	if err = writer.Write(resultParts); err != nil {
+		return "", nil, err
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return "", nil, err
+	}
+	return strings.TrimSpace(result.String()), nil, nil
+}
+
+// argHandlers is the table of argument handlers.
+var argHandlers = argHandlersType{
+	volumeArgHandler:       volumeArgHandler,
+	filePathArgHandler:     filePathArgHandler,
+	outputPathArgHandler:   outputPathArgHandler,
+	mountArgHandler:        mountArgHandler,
+	builderCacheArgHandler: builderCacheArgHandler,
+	buildContextArgHandler: buildContextArgHandler,
 }

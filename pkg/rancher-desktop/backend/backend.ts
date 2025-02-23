@@ -6,6 +6,7 @@ import * as childProcess from '@pkg/utils/childProcess';
 import EventEmitter from '@pkg/utils/eventEmitter';
 import { RecursiveKeys, RecursivePartial, RecursiveReadonly } from '@pkg/utils/typeUtils';
 
+import type { ContainerEngineClient } from './containerClient';
 import type { KubernetesBackend } from './k8s';
 
 export enum State {
@@ -147,6 +148,11 @@ export interface VMBackend extends EventEmitter<BackendEvents> {
   reset(config: BackendSettings): Promise<void>;
 
   /**
+   * Apply the settings update that does not require a backend restart.
+   */
+  handleSettingsUpdate(config: BackendSettings): Promise<void>;
+
+  /**
    * Check if applying the given settings would require the backend to restart.
    */
   requiresRestartReasons(config: RecursivePartial<BackendSettings>): Promise<RestartReasons>;
@@ -175,6 +181,7 @@ export interface VMBackend extends EventEmitter<BackendEvents> {
 
   readonly executor: VMExecutor;
   readonly kubeBackend: KubernetesBackend;
+  readonly containerEngineClient: ContainerEngineClient;
 }
 
 /**
@@ -197,8 +204,13 @@ export type execOptions = childProcess.CommonOptions & {
  */
 export interface VMExecutor {
   /**
+   * The backend in use.
+   */
+  readonly backend: VMBackend['backend'];
+
+  /**
    * execCommand runs the given command in the virtual machine.
-   * @param options Execution options.  If capture is set, standard output is
+   * @param execOptions Execution options.  If capture is set, standard output is
    *    returned.
    * @param command The command to execute.
    */
@@ -209,11 +221,22 @@ export interface VMExecutor {
   /**
    * spawn the given command in the virtual machine, returning the child
    * process itself.
+   * @note On Windows, this will be within the network / pid namespace.
    * @param options Execution options.
    * @param command The command to execute.
    */
   spawn(...command: string[]): childProcess.ChildProcess;
   spawn(options: execOptions, ...command: string[]): childProcess.ChildProcess;
+
+  /**
+   * Read the contents of the given file.  If the file is a symlink, the target
+   * will be read instead.
+   * @param filePath The path inside the VM to read.
+   * @param [options.encoding='utf-8'] The encoding of the file.
+   * @returns The contents of the file.
+   */
+  readFile(filePath: string): Promise<string>;
+  readFile(filePath: string, options: Partial<{ encoding: BufferEncoding }>): Promise<string>;
 
   /**
    * Write the given contents to a given file name in the VM.
@@ -224,4 +247,20 @@ export interface VMExecutor {
    */
   writeFile(filePath: string, fileContents: string): Promise<void>;
   writeFile(filePath: string, fileContents: string, permissions: fs.Mode): Promise<void>;
+
+  /**
+   * Copy the given file from the host into the VM.
+   * @param hostPath The source path, on the host.
+   * @param vmPath The destination path, inside the VM.
+   * @note The behaviour of copying a directory is undefined.
+   */
+  copyFileIn(hostPath: string, vmPath: string): Promise<void>;
+
+  /**
+   * Copy the given file from the VM into the host.
+   * @param vmPath The source path, inside the VM.
+   * @param hostPath The destination path, on the host.
+   * @note The behaviour of copying a directory is undefined.
+   */
+  copyFileOut(vmPath: string, hostPath: string): Promise<void>;
 }

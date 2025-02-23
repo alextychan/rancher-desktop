@@ -1,26 +1,14 @@
+import path from 'path';
+
 import { app, dialog } from 'electron';
 
 import { webRoot, createWindow } from '.';
 
-import { NavItemName } from '@pkg/config/transientSettings';
-
-interface NavItems {
-  name: NavItemName;
-  tabs?: string[];
-}
-
-export const preferencesNavItems: NavItems[] = [
-  {
-    name: 'Application',
-    tabs: ['behavior', 'environment'],
-  },
-  { name: process.platform === 'win32' ? 'WSL' : 'Virtual Machine' },
-  {
-    name: 'Container Engine',
-    tabs: ['general', 'allowed-images'],
-  },
-  { name: 'Kubernetes' },
-];
+import { Help } from '@pkg/config/help';
+import paths from '@pkg/utils/paths';
+import { CommandOrControl, Shortcuts } from '@pkg/utils/shortcuts';
+import { getVersion } from '@pkg/utils/version';
+import { preferencesNavItems } from '@pkg/window/preferenceConstants';
 
 let isDirty = false;
 
@@ -36,12 +24,72 @@ export function openPreferences() {
     resizable:       false,
     minimizable:     false,
     show:            false,
+    icon:            path.join(paths.resources, 'icons', 'logo-square-512.png'),
     webPreferences:  {
       devTools:         !app.isPackaged,
       nodeIntegration:  true,
       contextIsolation: false,
     },
   });
+
+  if (!Shortcuts.isRegistered(window)) {
+    Shortcuts.register(
+      window,
+      [{
+        key:      '?',
+        meta:     true,
+        platform: 'darwin',
+      }, {
+        key:      'F1',
+        platform: ['win32', 'linux'],
+      }],
+      async() => {
+        Help.preferences.openUrl(await getVersion());
+      },
+      'preferences help',
+    );
+
+    Shortcuts.register(
+      window,
+      { key: 'Escape' },
+      () => {
+        window.close();
+      },
+      'Close preferences dialog',
+    );
+
+    preferencesNavItems.forEach(({ name }, index) => {
+      Shortcuts.register(
+        window,
+        {
+          ...CommandOrControl,
+          key: index + 1,
+        },
+        () => window.webContents.send('route', { name }),
+        `switch preferences tabs ${ name }`,
+      );
+    });
+
+    Shortcuts.register(
+      window,
+      {
+        ...CommandOrControl,
+        key: ']',
+      },
+      () => window.webContents.send('route', { direction: 'forward' }),
+      'switch preferences tabs by cycle [forward]',
+    );
+
+    Shortcuts.register(
+      window,
+      {
+        ...CommandOrControl,
+        key: '[',
+      },
+      () => window.webContents.send('route', { direction: 'back' }),
+      'switch preferences tabs by cycle [back]',
+    );
+  }
 
   window.webContents.on('ipc-message', (_event, channel) => {
     if (channel === 'preferences/load') {
@@ -50,7 +98,7 @@ export function openPreferences() {
   });
 
   window.on('close', (event) => {
-    if (!isDirty) {
+    if (!isDirty || process.env.RD_TEST === 'e2e') {
       return;
     }
 

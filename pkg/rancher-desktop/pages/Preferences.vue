@@ -1,22 +1,26 @@
 <script lang="ts">
 import os from 'os';
 
-import Vue from 'vue';
+import Vue, { VueConstructor } from 'vue';
 import { mapGetters, mapState } from 'vuex';
 
 import EmptyState from '@pkg/components/EmptyState.vue';
 import PreferencesBody from '@pkg/components/Preferences/ModalBody.vue';
+import PreferencesFooter from '@pkg/components/Preferences/ModalFooter.vue';
 import PreferencesHeader from '@pkg/components/Preferences/ModalHeader.vue';
 import PreferencesNav from '@pkg/components/Preferences/ModalNav.vue';
-import type { TransientSettings } from '@pkg/config/transientSettings';
+import type { NavItemName, TransientSettings } from '@pkg/config/transientSettings';
 import type { ServerState } from '@pkg/main/commandServer/httpCommandServer';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
-import { RecursivePartial } from '@pkg/utils/typeUtils';
-import { preferencesNavItems } from '@pkg/window/preferences';
+import { Direction, RecursivePartial } from '@pkg/utils/typeUtils';
+import { preferencesNavItems } from '@pkg/window/preferenceConstants';
 
-import PreferencesFooter from '@/components/Preferences/ModalFooter.vue';
+interface VuexBindings {
+  credentials: Omit<ServerState, 'pid'>;
+  getCurrentNavItem: NavItemName;
+}
 
-export default Vue.extend({
+export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
   name:       'preferences-modal',
   components: {
     PreferencesHeader, PreferencesNav, PreferencesBody, PreferencesFooter, EmptyState,
@@ -28,6 +32,7 @@ export default Vue.extend({
   async fetch() {
     await this.$store.dispatch('credentials/fetchCredentials');
     await this.$store.dispatch('preferences/fetchPreferences', this.credentials as ServerState);
+    await this.$store.dispatch('preferences/fetchLocked', this.credentials as ServerState);
     await this.$store.dispatch('transientSettings/fetchTransientSettings', this.credentials as ServerState);
     this.preferencesLoaded = true;
 
@@ -48,13 +53,30 @@ export default Vue.extend({
     },
   },
   beforeMount() {
-    window.addEventListener('keydown', this.handleKeypress, true);
+    ipcRenderer.on('route', async(event, args) => {
+      await this.navigateToTab(args);
+    });
+
+    ipcRenderer.invoke('versions/macOs').then((macOsVersion) => {
+      this.$store.dispatch('transientSettings/setMacOsVersion', macOsVersion);
+    });
+
+    ipcRenderer.invoke('host/isArm').then((isArm) => {
+      this.$store.dispatch('transientSettings/setIsArm', isArm);
+    });
   },
   beforeDestroy() {
-    window.removeEventListener('keydown', this.handleKeypress, true);
+    /**
+     * Removing the listeners resolves the issue of receiving duplicated messages from 'route' channel.
+     * Originated by: https://github.com/rancher-sandbox/rancher-desktop/issues/3232
+     */
+    ipcRenderer.removeAllListeners('route');
   },
   methods: {
     async navChanged(current: string) {
+      await this.commitNavItem(current);
+    },
+    async commitNavItem(current: string) {
       await this.$store.dispatch(
         'transientSettings/commitPreferences',
         {
@@ -106,18 +128,25 @@ export default Vue.extend({
         ],
       });
 
-      if (result.response === cancelPosition) {
-        return false;
-      }
-
-      return true;
+      return result.response !== cancelPosition;
     },
     reloadPreferences() {
       window.location.reload();
     },
-    handleKeypress(event: KeyboardEvent) {
-      if (event.key === 'Escape') {
-        this.closePreferences();
+    async navigateToTab(args: { name?: string, direction?: Direction}) {
+      const { name, direction } = args;
+
+      if (name) {
+        await this.commitNavItem(name);
+
+        return;
+      }
+
+      if (direction) {
+        const dir = (direction === 'forward' ? 1 : -1);
+        const idx = (this.navItems.length + this.navItems.indexOf(this.getCurrentNavItem) + dir) % this.navItems.length;
+
+        await this.commitNavItem(this.navItems[idx]);
       }
     },
   },
@@ -125,7 +154,10 @@ export default Vue.extend({
 </script>
 
 <template>
-  <div v-if="preferencesLoaded" class="modal-grid">
+  <div
+    v-if="preferencesLoaded"
+    class="modal-grid"
+  >
     <preferences-header
       class="preferences-header"
     />
@@ -142,14 +174,20 @@ export default Vue.extend({
       :preferences="getPreferences"
       v-on="$listeners"
     >
-      <div v-if="hasError" class="preferences-error">
+      <div
+        v-if="hasError"
+        class="preferences-error"
+      >
         <empty-state
           icon="icon-warning"
           heading="Unable to fetch preferences"
           body="Reload Preferences to try again."
         >
           <template #primary-action>
-            <button class="btn role-primary" @click="reloadPreferences">
+            <button
+              class="btn role-primary"
+              @click="reloadPreferences"
+            >
               Reload preferences
             </button>
           </template>

@@ -5,12 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
-	"syscall"
 
+	dockerconfig "github.com/docker/cli/cli/config"
 	"github.com/docker/docker-credential-helpers/credentials"
-	dockerconfig "github.com/docker/docker/cli/config"
 )
 
 type dockerConfigType map[string]interface{}
@@ -19,7 +19,7 @@ func getParsedConfig() (dockerConfigType, error) {
 	dockerConfig := make(dockerConfigType)
 	contents, err := os.ReadFile(configFile)
 	if err != nil {
-		if errors.Is(err, syscall.ENOENT) {
+		if errors.Is(err, fs.ErrNotExist) {
 			// Time to create a new config (or return no data)
 			return dockerConfig, nil
 		}

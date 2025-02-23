@@ -6,9 +6,9 @@ import timers from 'timers';
 import util from 'util';
 
 import semver from 'semver';
-import yaml from 'yaml';
 
 import { Architecture, BackendSettings, RestartReasons } from '../backend';
+import BackendHelper, { MANIFEST_CERT_MANAGER, MANIFEST_SPIN_OPERATOR } from '../backendHelper';
 import K3sHelper, { ExtraRequiresReasons, NoCachedK3sVersionsError, ShortVersion } from '../k3sHelper';
 import LimaBackend, { Action } from '../lima';
 
@@ -16,13 +16,14 @@ import INSTALL_K3S_SCRIPT from '@pkg/assets/scripts/install-k3s';
 import LOGROTATE_K3S_SCRIPT from '@pkg/assets/scripts/logrotate-k3s';
 import SERVICE_CRI_DOCKERD_SCRIPT from '@pkg/assets/scripts/service-cri-dockerd.initd';
 import SERVICE_K3S_SCRIPT from '@pkg/assets/scripts/service-k3s.initd';
-import { KubeClient } from '@pkg/backend/client';
-import { getImageProcessor } from '@pkg/backend/images/imageFactory';
 import * as K8s from '@pkg/backend/k8s';
+import { KubeClient } from '@pkg/backend/kube/client';
+import { LockedFieldError } from '@pkg/config/commandLineOptions';
 import { ContainerEngine } from '@pkg/config/settings';
 import mainEvents from '@pkg/main/mainEvents';
 import { checkConnectivity } from '@pkg/main/networking';
 import clone from '@pkg/utils/clone';
+import { SemanticVersionEntry } from '@pkg/utils/kubeVersions';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
 import { RecursivePartial } from '@pkg/utils/typeUtils';
@@ -40,6 +41,8 @@ export default class LimaKubernetesBackend extends events.EventEmitter implement
     this.k3sHelper.on('versions-updated', () => this.emit('versions-updated'));
     this.k3sHelper.initialize().catch((err) => {
       console.log('k3sHelper.initialize failed: ', err);
+      // If we fail to initialize, we still need to continue (with no versions).
+      this.emit('versions-updated');
     });
     mainEvents.on('network-ready', () => this.k3sHelper.networkReady());
   }
@@ -71,6 +74,13 @@ export default class LimaKubernetesBackend extends events.EventEmitter implement
     try {
       const persistedVersion = await K3sHelper.getInstalledK3sVersion(this.vm);
       const desiredVersion = await this.desiredVersion;
+
+      if (desiredVersion === undefined) {
+        // If we could not determine the desired version (e.g. we have no cached
+        // versions and the machine is offline), bail out.
+        return [undefined, false];
+      }
+
       const isDowngrade = (version: semver.SemVer | string) => {
         return !!persistedVersion && semver.gt(persistedVersion, version);
       };
@@ -103,7 +113,7 @@ export default class LimaKubernetesBackend extends events.EventEmitter implement
             const result = await showMessageBox(options, true);
 
             if (result.response !== 0) {
-              return [undefined, false];
+              return [undefined, true];
             }
           }
           console.log(`Going with alternative version ${ newVersion.raw }`);
@@ -126,8 +136,19 @@ export default class LimaKubernetesBackend extends events.EventEmitter implement
    */
   async install(config: BackendSettings, desiredVersion: semver.SemVer, allowSudo: boolean) {
     await this.progressTracker.action('Installing k3s', 50, async() => {
+      // installK3s removes old config and makes sure the directories are recreated
       await this.installK3s(desiredVersion);
-      await this.writeServiceScript(config, allowSudo);
+
+      const promises: Promise<void>[] = [];
+
+      promises.push(this.writeServiceScript(config, desiredVersion, allowSudo));
+      if (config.experimental?.containerEngine?.webAssembly?.enabled) {
+        promises.push(BackendHelper.configureRuntimeClasses(this.vm));
+        if (config.experimental?.kubernetes?.options?.spinkube) {
+          promises.push(BackendHelper.configureSpinOperator(this.vm));
+        }
+      }
+      await Promise.all(promises);
     });
 
     this.activeVersion = desiredVersion;
@@ -137,9 +158,8 @@ export default class LimaKubernetesBackend extends events.EventEmitter implement
    * Start Kubernetes.
    * @returns The Kubernetes endpoint
    */
-  async start(config_: BackendSettings, kubernetesVersion: semver.SemVer): Promise<string> {
+  async start(config_: BackendSettings, kubernetesVersion: semver.SemVer, kubeClient?: () => KubeClient): Promise<void> {
     const config = this.cfg = clone(config_);
-    let k3sEndpoint = '';
 
     // Remove flannel config if necessary, before starting k3s
     if (!config.kubernetes.options.flannel) {
@@ -152,7 +172,7 @@ export default class LimaKubernetesBackend extends events.EventEmitter implement
       await this.vm.execCommand({ root: true }, '/sbin/rc-service', '--ifnotstarted', 'k3s', 'start');
     });
 
-    await this.progressTracker.action(
+    const aborted = await this.progressTracker.action(
       'Waiting for Kubernetes API',
       100,
       async() => {
@@ -160,7 +180,7 @@ export default class LimaKubernetesBackend extends events.EventEmitter implement
         while (true) {
           if (this.vm.currentAction !== Action.STARTING) {
             // User aborted
-            return;
+            return true;
           }
           try {
             await this.vm.execCommand({ expectFailure: true }, 'ls', '/etc/rancher/k3s/k3s.yaml');
@@ -171,22 +191,22 @@ export default class LimaKubernetesBackend extends events.EventEmitter implement
           }
         }
         console.debug('/etc/rancher/k3s/k3s.yaml is ready.');
+
+        return false;
       },
     );
+
+    if (aborted) {
+      return;
+    }
     await this.progressTracker.action(
       'Updating kubeconfig',
       50,
       this.k3sHelper.updateKubeconfig(
-        async() => {
-          const k3sConfigString = await this.vm.execCommand({ capture: true, root: true }, 'cat', '/etc/rancher/k3s/k3s.yaml');
-          const k3sConfig = yaml.parse(k3sConfigString);
+        () => this.vm.execCommand({ capture: true, root: true }, 'cat', '/etc/rancher/k3s/k3s.yaml'),
+      ));
 
-          k3sEndpoint = k3sConfig?.clusters?.[0]?.cluster?.server;
-
-          return k3sConfigString;
-        }));
-
-    this.client = new KubeClient();
+    this.client = kubeClient?.() || new KubeClient();
 
     await this.progressTracker.action(
       'Waiting for services',
@@ -213,7 +233,16 @@ export default class LimaKubernetesBackend extends events.EventEmitter implement
       await this.progressTracker.action(
         'Removing Traefik',
         50,
-        this.k3sHelper.uninstallTraefik(this.client));
+        this.k3sHelper.uninstallHelmChart(this.client, 'traefik'));
+    }
+    if (!this.cfg?.experimental?.kubernetes?.options?.spinkube) {
+      await this.progressTracker.action(
+        'Removing spinkube operator',
+        50,
+        Promise.all([
+          this.k3sHelper.uninstallHelmChart(this.client, MANIFEST_CERT_MANAGER),
+          this.k3sHelper.uninstallHelmChart(this.client, MANIFEST_SPIN_OPERATOR),
+        ]));
     }
 
     await this.k3sHelper.getCompatibleKubectlVersion(this.activeVersion);
@@ -234,33 +263,6 @@ export default class LimaKubernetesBackend extends events.EventEmitter implement
           await new Promise(resolve => setTimeout(resolve, 5000));
         });
     }
-
-    // We can't install buildkitd earlier because if we were running an older version of rancher-desktop,
-    // we have to remove the kim buildkitd k8s artifacts. And we can't remove them until k8s is running.
-    // Note that if the user's workflow is:
-    // A. Only containerd
-    // settings version 3: containerd (which installs buildkitd)
-    // upgrade to settings version 4, still on containerd:
-    //   - remove the old kim/buildkitd artifacts
-    //   - set config.kubernetes.checkForExistingKimBuilder to false (forever)
-
-    // B. Mix of containerd and moby
-    // settings version 3: containerd (which installs buildkitd)
-    // settings version 3: switch to moby (which will uninstall buildkitd)
-    // upgrade to settings version 4, still on moby: do nothing here
-    // settings version 4, switch to containerd
-    //   - config.kubernetes.checkForExistingKimBuilder should be true, but there are no kim/buildkitd artifacts
-    //   - do nothing, and set config.kubernetes.checkForExistingKimBuilder to false (forever)
-
-    if (config.kubernetes.checkForExistingKimBuilder) {
-      this.client ??= new KubeClient();
-      await getImageProcessor(config.kubernetes.containerEngine, this.vm).removeKimBuilder(this.client.k8sClient);
-      // No need to remove kim builder components ever again.
-      this.vm.writeSetting({ kubernetes: { checkForExistingKimBuilder: false } });
-      this.emit('kim-builder-uninstalled');
-    }
-
-    return k3sEndpoint;
   }
 
   async stop() {
@@ -296,7 +298,7 @@ export default class LimaKubernetesBackend extends events.EventEmitter implement
   protected currentPort = 0;
 
   /** Helper object to manage available K3s versions. */
-  protected readonly k3sHelper: K3sHelper;
+  readonly k3sHelper: K3sHelper;
 
   protected client: KubeClient | null = null;
 
@@ -308,7 +310,7 @@ export default class LimaKubernetesBackend extends events.EventEmitter implement
     return this.activeVersion?.version ?? '';
   }
 
-  get availableVersions(): Promise<K8s.VersionEntry[]> {
+  get availableVersions(): Promise<SemanticVersionEntry[]> {
     return this.k3sHelper.availableVersions;
   }
 
@@ -320,31 +322,31 @@ export default class LimaKubernetesBackend extends events.EventEmitter implement
     return this.cfg?.kubernetes?.port ?? 6443;
   }
 
-  protected get desiredVersion(): Promise<semver.SemVer> {
+  protected get desiredVersion(): Promise<semver.SemVer | undefined> {
     return (async() => {
-      const availableVersions = (await this.k3sHelper.availableVersions).map(v => v.version);
-      const storedVersion = semver.parse(this.cfg?.kubernetes?.version);
-      const version = storedVersion ?? availableVersions[0];
+      let availableVersions: SemanticVersionEntry[];
+      let available = true;
 
-      if (!version) {
-        throw new Error('No version available');
-      }
+      try {
+        availableVersions = await this.k3sHelper.availableVersions;
 
-      const matchedVersion = availableVersions.find(v => v.compare(version) === 0);
-
-      if (matchedVersion) {
-        if (!storedVersion) {
-          // No (valid) stored version; save the selected one.
-          this.vm.writeSetting({ kubernetes: { version: matchedVersion.version } });
+        return await BackendHelper.getDesiredVersion(
+          this.cfg as BackendSettings,
+          availableVersions,
+          this.vm.noModalDialogs,
+          this.vm.writeSetting.bind(this.vm));
+      } catch (ex) {
+        // Locked field errors are fatal and will quit the application
+        if (ex instanceof LockedFieldError) {
+          throw ex;
         }
+        console.error(`Could not get desired version: ${ ex }`);
+        available = false;
 
-        return matchedVersion;
+        return undefined;
+      } finally {
+        mainEvents.emit('diagnostics-event', { id: 'kube-versions-available', available });
       }
-
-      console.error(`Could not use saved version ${ version.raw }, not in ${ availableVersions }`);
-      this.vm.writeSetting({ kubernetes: { version: availableVersions[0].version } });
-
-      return availableVersions[0];
     })();
   }
 
@@ -364,19 +366,23 @@ export default class LimaKubernetesBackend extends events.EventEmitter implement
   /**
    * Write the openrc script for k3s.
    */
-  protected async writeServiceScript(cfg: BackendSettings, allowSudo: boolean) {
+  protected async writeServiceScript(cfg: BackendSettings, desiredVersion: semver.SemVer, allowSudo: boolean) {
     const config: Record<string, string> = {
       PORT:            this.desiredPort.toString(),
-      ENGINE:          cfg.kubernetes.containerEngine ?? ContainerEngine.NONE,
-      ADDITIONAL_ARGS: '',
+      ENGINE:          cfg.containerEngine.name ?? ContainerEngine.NONE,
+      ADDITIONAL_ARGS: `--node-ip ${ await this.vm.ipAddress }`,
       LOG_DIR:         paths.logs,
+      USE_CRI_DOCKERD: BackendHelper.requiresCRIDockerd(cfg.containerEngine.name, desiredVersion.version).toString(),
     };
 
-    if (allowSudo && os.platform() === 'darwin') {
+    if (os.platform() === 'darwin') {
       if (cfg.kubernetes.options.flannel) {
-        const iface = await this.vm.getListeningInterface();
+        const { iface, addr } = await this.vm.getListeningInterface(allowSudo);
 
         config.ADDITIONAL_ARGS += ` --flannel-iface ${ iface }`;
+        if (addr) {
+          config.ADDITIONAL_ARGS += ` --node-external-ip ${ addr }`;
+        }
       } else {
         console.log(`Disabling flannel and network policy`);
         config.ADDITIONAL_ARGS += ' --flannel-backend=none --disable-network-policy';
@@ -388,7 +394,7 @@ export default class LimaKubernetesBackend extends events.EventEmitter implement
     await this.vm.writeFile('/etc/init.d/cri-dockerd', SERVICE_CRI_DOCKERD_SCRIPT, 0o755);
     await this.vm.writeConf('cri-dockerd', {
       LOG_DIR: paths.logs,
-      ENGINE:  cfg.kubernetes.containerEngine ?? ContainerEngine.NONE,
+      ENGINE:  cfg.containerEngine.name ?? ContainerEngine.NONE,
     });
     await this.vm.writeFile('/etc/init.d/k3s', SERVICE_K3S_SCRIPT, 0o755);
     await this.vm.writeConf('k3s', config);
@@ -424,13 +430,15 @@ export default class LimaKubernetesBackend extends events.EventEmitter implement
 
           return 'restart';
         },
-        'kubernetes.port':                        undefined,
-        'kubernetes.containerEngine':             undefined,
-        'kubernetes.enabled':                     undefined,
-        'kubernetes.options.traefik':             undefined,
-        'kubernetes.options.flannel':             undefined,
-        'kubernetes.suppressSudo':                undefined,
-        'containerEngine.imageAllowList.enabled': undefined,
+        'application.adminAccess':                          undefined,
+        'containerEngine.allowedImages.enabled':            undefined,
+        'containerEngine.name':                             undefined,
+        'experimental.containerEngine.webAssembly.enabled': undefined,
+        'experimental.kubernetes.options.spinkube':         undefined,
+        'kubernetes.port':                                  undefined,
+        'kubernetes.enabled':                               undefined,
+        'kubernetes.options.traefik':                       undefined,
+        'kubernetes.options.flannel':                       undefined,
       },
       extra,
     );

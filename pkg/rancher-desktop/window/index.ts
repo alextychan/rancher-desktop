@@ -1,16 +1,21 @@
 import os from 'os';
+import path from 'path';
 
-import Electron, { BrowserWindow, app, shell } from 'electron';
-
-import { openPreferences } from './preferences';
+import Electron, {
+  BrowserWindow, app, shell, ipcMain, nativeTheme, screen, WebContentsView,
+} from 'electron';
 
 import * as K8s from '@pkg/backend/k8s';
+import { getSettings } from '@pkg/config/settingsImpl';
 import { IpcRendererEvents } from '@pkg/typings/electron-ipc';
-import { isDevEnv } from '@pkg/utils/environment';
+import { isDevBuild } from '@pkg/utils/environment';
 import Logging from '@pkg/utils/logging';
-import { Shortcuts } from '@pkg/utils/shortcuts';
+import paths from '@pkg/utils/paths';
+import { CommandOrControl, Shortcuts } from '@pkg/utils/shortcuts';
+import { mainRoutes } from '@pkg/window/constants';
+import { openPreferences } from '@pkg/window/preferences';
 
-const console = Logging.background;
+const console = Logging[`window_${ process.type || 'unknown' }`];
 
 /**
  * A mapping of window key (which is our own construct) to a window ID (which is
@@ -18,7 +23,7 @@ const console = Logging.background;
  */
 export const windowMapping: Record<string, number> = {};
 
-export const webRoot = `app://${ isDevEnv ? '' : '.' }`;
+export const webRoot = `app://${ isDevBuild ? '' : '.' }`;
 
 /**
  * Restore or focus a window if it is already open
@@ -52,7 +57,6 @@ export function getWindow(name: string): Electron.BrowserWindow | null {
  * @param name The window identifier; this controls window re-use.
  * @param url The URL to load into the window.
  * @param options A hash of options used by `new BrowserWindow(options)`
- * @param prefs Options to control the new window.
  */
 export function createWindow(name: string, url: string, options: Electron.BrowserWindowConstructorOptions) {
   let window = getWindow(name);
@@ -62,10 +66,16 @@ export function createWindow(name: string, url: string, options: Electron.Browse
   }
 
   const isInternalURL = (url: string) => {
-    return url.startsWith(`${ webRoot }/`);
+    return url.startsWith(`${ webRoot }/`) || url.startsWith('x-rd-extension://');
   };
 
   window = new BrowserWindow(options);
+  window.webContents.on('console-message', (event, level, message, line, sourceId) => {
+    const levelNum = level === 0 ? 0 : level === 1 ? 1 : level === 2 ? 2 : level === 3 ? 3 : 0;
+    const key = ['debug', 'info', 'warn', 'error'] as const;
+
+    console[key[levelNum]](`${ name }@${ line }: ${ message }`);
+  });
   window.webContents.on('will-navigate', (event, input) => {
     if (isInternalURL(input)) {
       return;
@@ -83,7 +93,7 @@ export function createWindow(name: string, url: string, options: Electron.Browse
     return { action: 'deny' };
   });
   window.webContents.on('did-fail-load', (event, errorCode, errorDescription, url) => {
-    console.log(`Failed to load ${ url }: ${ errorCode } (${ errorDescription })`);
+    console.log(`Failed to load ${ url }: ${ errorCode } (${ errorDescription })`, event);
   });
   console.debug('createWindow() name:', name, ' url:', url);
   window.loadURL(url);
@@ -97,14 +107,22 @@ const mainUrl = process.env.RD_ENV_PLUGINS_DEV ? 'https://localhost:8888' : `${ 
 /**
  * Open the main window; if it is already open, focus it.
  */
-export function openMain(showPreferencesModal = false) {
+export function openMain() {
   console.debug('openMain() webRoot:', webRoot);
+
+  const { width, height } = screen.getPrimaryDisplay().workAreaSize;
+
+  const defaultWidth = Math.min(Math.trunc(width * 0.8), 1280);
+  const defaultHeight = Math.min(Math.trunc(height * 0.8), 720);
+
   const window = createWindow(
     'main',
     mainUrl,
     {
-      width:          940,
-      height:         600,
+      width:          defaultWidth,
+      height:         defaultHeight,
+      resizable:      !process.env.RD_MOCK_FOR_SCREENSHOTS, // remove window's shadows while taking screenshots
+      icon:           path.join(paths.resources, 'icons', 'logo-square-512.png'),
       webPreferences: {
         devTools:         !app.isPackaged,
         nodeIntegration:  true,
@@ -115,31 +133,277 @@ export function openMain(showPreferencesModal = false) {
   if (!Shortcuts.isRegistered(window)) {
     Shortcuts.register(
       window,
-      [{
-        key:      ',',
-        meta:     true,
-        platform: 'darwin',
-      }, {
-        key:      ',',
-        control:  true,
-        platform: ['linux', 'win32'],
-      }],
-      () => openMain(true),
+      {
+        ...CommandOrControl,
+        key: ',',
+      },
+      () => openPreferences(),
       'open preferences',
+    );
+
+    mainRoutes.forEach(({ route }, index) => {
+      Shortcuts.register(
+        window,
+        {
+          ...CommandOrControl,
+          key: index + 1,
+        },
+        () => window.webContents.send('route', { path: route }),
+        `switch main tabs ${ route }`,
+      );
+    });
+
+    Shortcuts.register(
+      window,
+      {
+        ...CommandOrControl,
+        key: ']',
+      },
+      () => window.webContents.send('route', { direction: 'forward' }),
+      'switch preferences tabs by cycle [forward]',
+    );
+
+    Shortcuts.register(
+      window,
+      {
+        ...CommandOrControl,
+        key: '[',
+      },
+      () => window.webContents.send('route', { direction: 'back' }),
+      'switch preferences tabs by cycle [back]',
     );
   }
 
-  app.dock?.show();
+  window.on('closed', () => {
+    const cfg = getSettings();
 
-  if (showPreferencesModal) {
-    openPreferences();
-  }
-
-  window.webContents.on('ipc-message', (_event, channel) => {
-    if (channel === 'app-ready' && showPreferencesModal) {
-      openPreferences();
+    if (cfg.application.window.quitOnClose) {
+      BrowserWindow.getAllWindows().forEach((window) => {
+        window.close();
+      });
+      app.quit();
     }
   });
+
+  app.dock?.show();
+}
+
+let view: WebContentsView | undefined;
+/** The extension that has been navigated to (but might not be loaded yet). */
+let currentExtension: { id: string, relPath: string } | undefined;
+/** The extension that has been loaded. */
+let lastOpenExtension: { id: string, relPath: string } | undefined;
+
+/**
+ * Attaches a browser view to the main window
+ */
+const createView = () => {
+  const mainWindow = getWindow('main');
+  const hostInfo = {
+    arch:     process.arch,
+    hostname: os.hostname(),
+  };
+
+  if (!mainWindow) {
+    throw new Error('Failed to get main window, cannot create view');
+  }
+
+  view = new WebContentsView({
+    webPreferences: {
+      nodeIntegration:     false,
+      contextIsolation:    true,
+      preload:             path.join(paths.resources, 'preload.js'),
+      sandbox:             true,
+      additionalArguments: [JSON.stringify(hostInfo)],
+    },
+  });
+  mainWindow.contentView.addChildView(view);
+  mainWindow.contentView.addListener('bounds-changed', () => {
+    setImmediate(() => mainWindow.webContents.send('extensions/getContentArea'));
+  });
+
+  const backgroundColor = nativeTheme.shouldUseDarkColors ? '#202c33' : '#f4f4f6';
+
+  view.setBackgroundColor(backgroundColor);
+};
+
+/**
+ * Updates the browser view size and position
+ * @param window The main window
+ * @param payload Payload representing coordinates for view position
+ */
+const updateView = (window: Electron.BrowserWindow, payload: { top: number, right: number, bottom: number, left: number }) => {
+  if (!view) {
+    return;
+  }
+
+  const zoomFactor = window.webContents.getZoomFactor();
+
+  view.setBounds({
+    x:      Math.round(payload.left * zoomFactor),
+    y:      Math.round(payload.top * zoomFactor),
+    width:  Math.round((payload.right - payload.left) * zoomFactor),
+    height: Math.round((payload.bottom - payload.top) * zoomFactor),
+  });
+};
+
+/**
+ * Navigates to the current desired extension
+ */
+function extensionNavigate() {
+  if (!currentExtension) {
+    return;
+  }
+  const { id, relPath } = currentExtension;
+
+  const url = `x-rd-extension://${ id }/ui/dashboard-tab/${ relPath }`;
+
+  view?.webContents
+    .loadURL(url)
+    .then(() => {
+      lastOpenExtension = currentExtension;
+    })
+    .then(() => {
+      view?.webContents.setZoomLevel(getWindow('main')?.webContents.getZoomLevel() ?? 0);
+    })
+    .catch((err) => {
+      console.error(`Can't load the extension URL ${ url }: `, err);
+    });
+}
+
+const zoomInKeys = new Set(`+${ process.platform === 'darwin' ? '=' : '' }`);
+const zoomOutKeys = new Set('-');
+const zoomResetKeys = new Set('0');
+const zoomAllKeys = new Set([...zoomInKeys, ...zoomOutKeys, ...zoomResetKeys]);
+
+function isZoomKeyCombo(input: Electron.Input) {
+  const modifier = input.control || input.meta;
+
+  return input.type === 'keyDown' && modifier && zoomAllKeys.has(input.key);
+}
+
+/**
+ * Adjusts the zoom level of the main window and attached browser view based on
+ * the given input.
+ * @param event The Electron Event that triggered this listener
+ * @param input The Electron Input associated with the event
+ */
+const extensionZoomListener = (event: Electron.Event, input: Electron.Input) => {
+  const window = getWindow('main');
+
+  if (!window) {
+    return;
+  }
+
+  if (isZoomKeyCombo(input)) {
+    event.preventDefault();
+    const currentZoomLevel = window.webContents.getZoomLevel();
+    const newZoomLevel = (() => {
+      if (zoomInKeys.has(input.key)) {
+        return currentZoomLevel + 0.5;
+      }
+      if (zoomOutKeys.has(input.key)) {
+        return currentZoomLevel - 0.5;
+      }
+      if (zoomResetKeys.has(input.key)) {
+        return 0;
+      }
+    })();
+
+    if (typeof newZoomLevel === 'undefined') {
+      console.debug('Extension Zoom Listener: Unable to determine zoom level');
+
+      return;
+    }
+
+    window.webContents.setZoomLevel(newZoomLevel);
+    view?.webContents.setZoomLevel(newZoomLevel);
+    setImmediate(() => window.webContents.send('extensions/getContentArea'));
+  }
+};
+
+/**
+ * Creates and positions the extension's browser view after coordinates are
+ * received from the renderer
+ * @param _event The Electron Ipc Main Event that triggered this listener
+ * @param args Arguments associated with the event
+ */
+function extensionGetContentAreaListener(_event: Electron.IpcMainEvent, payload: { top: number, right: number, bottom: number, left: number }) {
+  const window = getWindow('main');
+
+  if (!window) {
+    return;
+  }
+
+  if (!view) {
+    try {
+      createView();
+      window.webContents.on('before-input-event', extensionZoomListener);
+    } catch (e) {
+      window.webContents.send('err:extensions/open', e);
+      console.error(e);
+    }
+  }
+
+  updateView(window, payload);
+  if (currentExtension && (currentExtension.id !== lastOpenExtension?.id || currentExtension.relPath !== lastOpenExtension?.relPath)) {
+    extensionNavigate();
+  }
+}
+
+/**
+ * Opens an extension in a browser view and attaches it to the main window
+ * @param id The extension ID
+ * @param relPath The relative path to the extension root
+ */
+export function openExtension(id: string, relPath: string) {
+  console.debug(`openExtension(${ id })`);
+
+  const window = getWindow('main') ?? undefined;
+
+  if (!window) {
+    return;
+  }
+
+  currentExtension = { id, relPath };
+
+  if (!ipcMain.eventNames().includes('ok:extensions/getContentArea')) {
+    ipcMain.on('ok:extensions/getContentArea', extensionGetContentAreaListener);
+  }
+
+  window.webContents.send('extensions/getContentArea');
+
+  if (!Electron.app.isPackaged) {
+    Shortcuts.register(
+      window, {
+        ...CommandOrControl,
+        shift: true,
+        key:   'O', // U+004F Latin Capital Letter O
+      },
+      () => view?.webContents.openDevTools({ mode: 'detach' }),
+      'open developer tools for the extension',
+    );
+  }
+}
+
+/**
+ * Removes the extension's browser view from the main window
+ */
+export function closeExtension() {
+  currentExtension = undefined;
+  lastOpenExtension = undefined;
+  if (!view) {
+    return;
+  }
+
+  view.webContents.close();
+
+  const window = getWindow('main');
+
+  window?.contentView.removeChildView(view);
+  window?.webContents.removeListener('before-input-event', extensionZoomListener);
+  ipcMain.removeListener('ok:extensions/getContentArea', extensionGetContentAreaListener);
+  view = undefined;
 }
 
 /**
@@ -174,9 +438,10 @@ function resizeWindow(window: Electron.BrowserWindow, width: number, height: num
  * your dialog to show.
  *
  * @param id The URL for the dialog, corresponds to a Nuxt page; e.g. FirstRun.
+ * @param opts The usual browser-window options
  * @returns The opened window
  */
-export function openDialog(id: string, opts?: Electron.BrowserWindowConstructorOptions) {
+export function openDialog(id: string, opts?: Electron.BrowserWindowConstructorOptions, escapeKey = true) {
   console.debug('openDialog() id: ', id);
   const window = createWindow(
     id,
@@ -218,6 +483,17 @@ export function openDialog(id: string, opts?: Electron.BrowserWindowConstructorO
     }
   });
 
+  if (!Shortcuts.isRegistered(window) && escapeKey) {
+    Shortcuts.register(
+      window,
+      { key: 'Escape' },
+      () => {
+        window.close();
+      },
+      'Close dialog',
+    );
+  }
+
   return window;
 }
 
@@ -249,18 +525,18 @@ export async function openDenyRootDialog() {
   }));
 }
 
-export type reqMessageId = 'ok' | 'linux-nested' | 'win32-release' | 'macOS-release';
+export type reqMessageId = 'ok' | 'linux-nested' | 'win32-release' | 'win32-kernel' | 'macOS-release';
 
 /**
  * Open a dialog to show reason Desktop will not start
  * @param reasonId Specifies which message to show in dialog
  */
-export async function openUnmetPrerequisitesDialog(reasonId: reqMessageId) {
+export async function openUnmetPrerequisitesDialog(reasonId: reqMessageId, ...args: any[]) {
   const window = openDialog('UnmetPrerequisites', { frame: true });
 
   window.webContents.on('ipc-message', (event, channel) => {
     if (channel === 'dialog/load') {
-      window.webContents.send('dialog/populate', reasonId);
+      window.webContents.send('dialog/populate', reasonId, ...args);
     }
   });
   await (new Promise<void>((resolve) => {
@@ -321,34 +597,6 @@ export async function openSudoPrompt(explanations: Record<string, string[]>): Pr
   return result;
 }
 
-export async function openPathUpdate(): Promise<void> {
-  const window = openDialog(
-    'PathUpdate',
-    {
-      title:  'Rancher Desktop - Update',
-      frame:  true,
-      parent: getWindow('main') ?? undefined,
-    });
-
-  await (new Promise<void>((resolve) => {
-    window.on('closed', resolve);
-  }));
-}
-
-export async function openLegacyIntegrations(): Promise<void> {
-  const window = openDialog(
-    'LegacyIntegrationNotification',
-    {
-      title:  'Rancher Desktop - Legacy Integrations',
-      parent: getWindow('main') ?? undefined,
-    },
-  );
-
-  await (new Promise<void>((resolve) => {
-    window.on('closed', resolve);
-  }));
-}
-
 export async function showMessageBox(options: Electron.MessageBoxOptions, couldBeModal = false) {
   const mainWindow = couldBeModal ? getWindow('main') : null;
 
@@ -373,4 +621,21 @@ export function send(channel: string, ...args: any[]) {
       window.webContents.send(channel, ...args);
     }
   }
+}
+
+/**
+ * Center the dialog window in the middle of parent window - used on Windows / MacOs
+ * @param window parent window
+ * @param dialog dialog window
+ * @param offsetX
+ * @param offsetY
+ */
+export function centerDialog(window: BrowserWindow, dialog: BrowserWindow, offsetX = 0, offsetY = 0) {
+  const windowBounds = window.getBounds();
+  const dialogBounds = dialog.getBounds();
+
+  const x = Math.floor(windowBounds.x + ((windowBounds.width - dialogBounds.width) / 2) + offsetX);
+  const y = Math.floor(windowBounds.y + offsetY);
+
+  dialog.setPosition(x, y);
 }

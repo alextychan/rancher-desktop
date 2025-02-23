@@ -1,14 +1,16 @@
 <template>
-  <section class="dashboard">
-    <section class="troubleshooting">
-      <section class="general">
-        <troubleshooting-line-item>
-          <template #title>
+  <div class="troubleshooting">
+    <div class="troubleshooting-items">
+      <troubleshooting-line-item>
+        <template #title>
+          <span class="text-xl">
             {{ t('troubleshooting.general.logs.title') }}
-          </template>
-          <template #description>
-            {{ t('troubleshooting.general.logs.description') }}
-          </template>
+          </span>
+        </template>
+        <template #description>
+          {{ t('troubleshooting.general.logs.description') }}
+        </template>
+        <template #actions>
           <button
             data-test="logsButton"
             type="button"
@@ -17,24 +19,28 @@
           >
             {{ t('troubleshooting.general.logs.buttonText') }}
           </button>
-          <template #options>
-            <Checkbox
-              :value="isDebugging"
-              :disabled="alwaysDebugging"
-              :tooltip="debugModeTooltip"
-              label="Enable debug mode"
-              @input="updateDebug"
-            />
-          </template>
-        </troubleshooting-line-item>
-        <hr>
-        <troubleshooting-line-item>
-          <template #title>
+        </template>
+        <template #options>
+          <rd-checkbox
+            :value="isDebugging"
+            :disabled="alwaysDebugging"
+            :tooltip="debugModeTooltip"
+            :is-locked="debugLocked"
+            label="Enable debug mode"
+            @input="updateDebug"
+          />
+        </template>
+      </troubleshooting-line-item>
+      <troubleshooting-line-item>
+        <template #title>
+          <span class="text-xl">
             {{ t('troubleshooting.kubernetes.resetKubernetes.title') }}
-          </template>
-          <template #description>
-            {{ t('troubleshooting.kubernetes.resetKubernetes.description') }}
-          </template>
+          </span>
+        </template>
+        <template #description>
+          {{ t('troubleshooting.kubernetes.resetKubernetes.description') }}
+        </template>
+        <template #actions>
           <button
             data-test="k8sResetBtn"
             type="button"
@@ -43,15 +49,18 @@
           >
             {{ t('troubleshooting.kubernetes.resetKubernetes.buttonText') }}
           </button>
-        </troubleshooting-line-item>
-        <hr>
-        <troubleshooting-line-item>
-          <template #title>
+        </template>
+      </troubleshooting-line-item>
+      <troubleshooting-line-item>
+        <template #title>
+          <span class="text-xl">
             {{ t('troubleshooting.general.factoryReset.title') }}
-          </template>
-          <template #description>
-            {{ t('troubleshooting.general.factoryReset.description') }}
-          </template>
+          </span>
+        </template>
+        <template #description>
+          {{ t('troubleshooting.general.factoryReset.description') }}
+        </template>
+        <template #actions>
           <button
             data-test="factoryResetButton"
             type="button"
@@ -60,37 +69,38 @@
           >
             {{ t('troubleshooting.general.factoryReset.buttonText') }}
           </button>
-        </troubleshooting-line-item>
-        <section class="need-help">
-          <hr>
-          <span
-            class="description"
-            v-html="t('troubleshooting.needHelp', { }, true)"
-          />
-        </section>
-      </section>
-    </section>
-  </section>
+        </template>
+      </troubleshooting-line-item>
+    </div>
+    <div class="need-help">
+      <hr>
+      <span
+        class="description"
+        v-html="t('troubleshooting.needHelp', { }, true)"
+      />
+    </div>
+  </div>
 </template>
 
 <script>
 
-import { Checkbox } from '@rancher/components';
+import _ from 'lodash';
 
 import TroubleshootingLineItem from '@pkg/components/TroubleshootingLineItem.vue';
-import { defaultSettings, runInDebugMode } from '@pkg/config/settings';
-
-const { ipcRenderer } = require('electron');
+import RdCheckbox from '@pkg/components/form/RdCheckbox.vue';
+import { defaultSettings } from '@pkg/config/settings';
+import { ipcRenderer } from '@pkg/utils/ipcRenderer';
 
 export default {
   name:       'Troubleshooting',
   title:      'Troubleshooting',
-  components: { TroubleshootingLineItem, Checkbox },
+  components: { TroubleshootingLineItem, RdCheckbox },
   data:       () => ({
     state:           ipcRenderer.sendSync('k8s-state'),
     settings:        defaultSettings,
-    isDebugging:     runInDebugMode(defaultSettings.debug),
-    alwaysDebugging: runInDebugMode(false),
+    debugLocked:     false,
+    isDebugging:     false,
+    alwaysDebugging: false,
   }),
   computed: {
     debugModeTooltip() {
@@ -107,12 +117,22 @@ export default {
     });
     ipcRenderer.on('settings-read', (_, newSettings) => {
       this.$data.settings = newSettings;
-      this.$data.isDebugging = runInDebugMode(newSettings.debug);
+      ipcRenderer.send('get-debugging-statuses');
     });
     ipcRenderer.on('settings-update', (_, newSettings) => {
       this.$data.settings = newSettings;
     });
+    ipcRenderer.on('is-debugging', (_, status) => {
+      this.$data.isDebugging = status;
+    });
+    ipcRenderer.on('always-debugging', (_, status) => {
+      this.$data.alwaysDebugging = status;
+    });
     ipcRenderer.send('settings-read');
+    ipcRenderer.invoke('get-locked-fields').then((lockedFields) => {
+      this.$data.debugLocked = _.get(lockedFields, 'application.debug');
+    });
+    ipcRenderer.send('get-debugging-statuses');
   },
   methods: {
     async factoryReset() {
@@ -150,8 +170,8 @@ export default {
       ipcRenderer.send('show-logs');
     },
     updateDebug(value) {
-      this.$data.isDebugging = runInDebugMode(value);
-      ipcRenderer.invoke('settings-write', { debug: value });
+      ipcRenderer.invoke('settings-write', { application: { debug: value } });
+      ipcRenderer.send('get-debugging-statuses');
     },
     async resetKubernetes() {
       const cancelPosition = 1;
@@ -189,17 +209,14 @@ export default {
 </script>
 
 <style lang="scss" scoped>
-  .troubleshooting {
-    max-width: 56rem;
+  .troubleshooting-items {
+    display: flex;
+    flex-direction: column;
   }
 
-  .general,
-  .kubernetes {
-    margin-top: 2rem;
-  }
-
-  .title {
-    padding-bottom: 0.25rem;
+  .text-xl {
+    font-size: 1.25rem;
+    line-height: 1.75rem;
   }
 
   .btn-xs {

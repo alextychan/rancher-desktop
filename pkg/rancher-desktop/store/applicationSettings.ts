@@ -1,7 +1,8 @@
+import _ from 'lodash';
 
 import { ActionContext, MutationsType } from './ts-helpers';
 
-import { load as loadSettings } from '@pkg/config/settings';
+import { defaultSettings } from '@pkg/config/settings';
 import type { PathManagementStrategy } from '@pkg/integrations/pathManager';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
 
@@ -10,26 +11,19 @@ import { ipcRenderer } from '@pkg/utils/ipcRenderer';
  */
 type State = {
   pathManagementStrategy: PathManagementStrategy;
-  sudoAllowed: boolean;
 };
+
+const cfg = _.cloneDeep(defaultSettings);
 
 export const state: () => State = () => {
   // While we load the settings from disk here, we only otherwise interact with
   // the settings only via ipcRenderer.
-  const cfg = loadSettings();
-
-  return {
-    pathManagementStrategy: cfg.pathManagementStrategy,
-    sudoAllowed:            !cfg.kubernetes.suppressSudo,
-  };
+  return { pathManagementStrategy: cfg.application.pathManagementStrategy };
 };
 
 export const mutations: MutationsType<State> = {
   SET_PATH_MANAGEMENT_STRATEGY(state: State, strategy: PathManagementStrategy) {
     state.pathManagementStrategy = strategy;
-  },
-  SET_SUDO_ALLOWED(state: State, allowed: boolean) {
-    state.sudoAllowed = allowed;
   },
 } as const;
 
@@ -41,26 +35,13 @@ export const actions = {
   },
   async commitPathManagementStrategy({ commit }: AppActionContext, strategy: PathManagementStrategy) {
     commit('SET_PATH_MANAGEMENT_STRATEGY', strategy);
-    await ipcRenderer.invoke('settings-write', { pathManagementStrategy: strategy });
-  },
-  setSudoAllowed({ commit, state }: AppActionContext, allowed: boolean) {
-    if (allowed !== state.sudoAllowed) {
-      commit('SET_SUDO_ALLOWED', allowed);
-    }
-  },
-  async commitSudoAllowed({ commit, state }: AppActionContext, allowed: boolean) {
-    if (allowed !== state.sudoAllowed) {
-      commit('SET_SUDO_ALLOWED', allowed);
-      await ipcRenderer.invoke('settings-write', { kubernetes: { suppressSudo: !allowed } });
-    }
+    cfg.application.pathManagementStrategy = strategy;
+    await ipcRenderer.invoke('settings-write', { application: { pathManagementStrategy: strategy } });
   },
 };
 
 export const getters = {
   pathManagementStrategy({ pathManagementStrategy }: State) {
     return pathManagementStrategy;
-  },
-  sudoAllowed({ sudoAllowed }: State) {
-    return sudoAllowed;
   },
 };

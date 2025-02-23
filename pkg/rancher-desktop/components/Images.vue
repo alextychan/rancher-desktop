@@ -3,7 +3,10 @@
   -->
 <template>
   <div>
-    <div v-if="state === 'READY'" ref="fullWindow">
+    <div
+      v-if="state === 'READY'"
+      ref="fullWindow"
+    >
       <SortableTable
         ref="imagesTable"
         class="imagesTable"
@@ -12,6 +15,7 @@
         default-sort-by="imageName"
         :headers="headers"
         :rows="rows"
+        no-rows-key="images.sortableTables.noRows"
         :table-actions="true"
         :paging="true"
         @selection="updateSelection"
@@ -32,7 +36,12 @@
                 :value="selectedNamespace"
                 @change="handleChangeNamespace($event)"
               >
-                <option v-for="item in imageNamespaces" :key="item" :value="item" :selected="item === selectedNamespace">
+                <option
+                  v-for="item in imageNamespaces"
+                  :key="item"
+                  :value="item"
+                  :selected="item === selectedNamespace"
+                >
                   {{ item }}
                 </option>
               </select>
@@ -62,6 +71,7 @@
             :current-command="currentCommand"
             :image-output-culler="imageOutputCuller"
             :show-status="false"
+            :image-to-pull="imageToPull"
             @ok:process-end="resetCurrentCommand"
             @ok:show="toggleOutput"
           />
@@ -80,9 +90,10 @@
 </template>
 
 <script>
-
 import SortableTable from '@pkg/components/SortableTable';
 import { Card, Checkbox } from '@rancher/components';
+import _ from 'lodash';
+import { mapState, mapMutations } from 'vuex';
 
 import ImagesOutputWindow from '@pkg/components/ImagesOutputWindow.vue';
 import getImageOutputCuller from '@pkg/utils/imageOutputCuller';
@@ -100,6 +111,10 @@ export default {
     images: {
       type:     Array,
       required: true,
+    },
+    protectedImages: {
+      type:    Array,
+      default: () => [],
     },
     imageNamespaces: {
       type:     Array,
@@ -154,9 +169,11 @@ export default {
       imageOutputCuller:                null,
       mainWindowScroll:                 -1,
       selected:                         [],
+      imageToPull:                      null,
     };
   },
   computed: {
+    ...mapState('action-menu', { menuImages: state => state.resources?.map(i => i.imageName) ?? [] }),
     keyedImages() {
       return this.images
         .map((image, index) => {
@@ -186,36 +203,36 @@ export default {
         .map(this.getTaggedImage);
     },
     rows() {
-      return this.filteredImages
+      const filteredImages = _.cloneDeep(this.filteredImages);
+
+      return filteredImages
         .map((image) => {
-          if (!image.availableActions) {
           // The `availableActions` property is used by the ActionMenu to fill
           // out the menu entries.  Note that we need to modify the items
           // in-place, as SortableTable depends on object identity to manage its
           // selection state.
-            image.availableActions = [
-              {
-                label:   this.t('images.manager.table.action.push'),
-                action:  'doPush',
-                enabled: this.isPushable(image),
-                icon:    'icon icon-upload',
-              },
-              {
-                label:      this.t('images.manager.table.action.delete'),
-                action:     'deleteImage',
-                enabled:    this.isDeletable(image),
-                icon:       'icon icon-delete',
-                bulkable:   true,
-                bulkAction: 'deleteImages',
-              },
-              {
-                label:   this.t('images.manager.table.action.scan'),
-                action:  'scanImage',
-                enabled: true,
-                icon:    'icon icon-info',
-              },
-            ].filter(x => x.enabled);
-          }
+          image.availableActions = [
+            {
+              label:   this.t('images.manager.table.action.push'),
+              action:  'doPush',
+              enabled: this.isPushable(image),
+              icon:    'icon icon-upload',
+            },
+            {
+              label:      this.t('images.manager.table.action.delete'),
+              action:     'deleteImage',
+              enabled:    this.isDeletable(image),
+              icon:       'icon icon-delete',
+              bulkable:   true,
+              bulkAction: 'deleteImages',
+            },
+            {
+              label:   this.t('images.manager.table.action.scan'),
+              action:  'scanImage',
+              enabled: true,
+              icon:    'icon icon-info-circle',
+            },
+          ].filter(x => x.enabled);
           // ActionMenu callbacks - SortableTable assumes that these methods live
           // on the rows directly.
           if (!image.doPush) {
@@ -242,11 +259,22 @@ export default {
     },
   },
 
+  watch: {
+    rows: {
+      handler(newRows) {
+        if (this.menuImages.some(name => newRows.map(r => r.imageName).includes(name))) {
+          this.hideMenu();
+        }
+      },
+    },
+  },
+
   mounted() {
     this.main = document.getElementsByTagName('main')[0];
   },
 
   methods: {
+    ...mapMutations('action-menu', { hideMenu: 'hide' }),
     updateSelection(val) {
       this.selected = val;
     },
@@ -333,7 +361,7 @@ export default {
     scanImage(obj) {
       const taggedImageName = `${ obj.imageName.trim() }:${ this.imageTag(obj.tag) }`;
 
-      this.$router.push({ name: 'images-scans-image-name', params: { image: taggedImageName } });
+      this.$router.push({ name: 'images-scans-image-name', params: { image: taggedImageName, namespace: this.selectedNamespace } });
     },
     imageTag(tag) {
       return tag === '<none>' ? 'latest' : `${ tag.trim() }`;
@@ -342,7 +370,7 @@ export default {
       return row.imageName && row.imageName !== '<none>';
     },
     isDeletable(row) {
-      return row.imageName !== 'moby/buildkit' && !row.imageName.startsWith('rancher/');
+      return !this.protectedImages.includes(row.imageName);
     },
     isPushable(row) {
       // If it doesn't contain a '/', it's certainly not pushable,

@@ -15,6 +15,7 @@
     <SortableTable
       :headers="headers"
       :rows="rows"
+      no-rows-key="portForwarding.sortableTables.noRows"
       key-field="key"
       default-sort-by="namespace"
       :table-actions="false"
@@ -33,7 +34,10 @@
         </div>
       </template>
       <template #col:listenPort="{row}">
-        <div v-if="serviceBeingEditedIs(row)" class="listen-port-div">
+        <div
+          v-if="serviceBeingEditedIs(row)"
+          class="listen-port-div"
+        >
           <input
             v-focus
             type="number"
@@ -50,7 +54,10 @@
         </div>
       </template>
       <template #row-actions="{row}">
-        <div v-if="row.row.listenPort === undefined && !serviceBeingEditedIs(row.row)" class="action-div">
+        <div
+          v-if="row.row.listenPort === undefined && !serviceBeingEditedIs(row.row)"
+          class="action-div"
+        >
           <button
             class="btn btn-sm role-tertiary"
             @click="emitEditPortForward(row.row)"
@@ -58,21 +65,27 @@
             Forward
           </button>
         </div>
-        <div v-else-if="serviceBeingEditedIs(row.row)" class="action-div">
+        <div
+          v-else-if="serviceBeingEditedIs(row.row)"
+          class="action-div"
+        >
           <button
-            class="btn btn-sm role-tertiary"
+            class="btn btn-sm role-tertiary btn-icon"
             @click="emitCancelEditPortForward(row.row)"
           >
             <span class="icon icon-x icon-lg" />
           </button>
           <button
-            class="btn btn-sm role-tertiary"
+            class="btn btn-sm role-tertiary btn-icon"
             @click="emitUpdatePortForward()"
           >
             <span class="icon icon-checkmark icon-lg" />
           </button>
         </div>
-        <div v-else class="action-div">
+        <div
+          v-else
+          class="action-div"
+        >
           <button
             class="btn btn-sm role-tertiary"
             @click="emitCancelPortForward(row.row)"
@@ -102,7 +115,7 @@ export default Vue.extend({
   },
   directives: {
     focus: {
-      inserted: function(element) {
+      inserted(element) {
         element.focus();
       },
     },
@@ -227,6 +240,13 @@ export default Vue.extend({
 </script>
 
 <style>
+  .btn-icon {
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+    align-items: center;
+  }
+
   .action-div {
     display: flex;
     flex-direction: row-reverse;
